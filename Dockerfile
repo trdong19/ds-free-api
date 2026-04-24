@@ -1,5 +1,5 @@
 # ---------- 构建阶段 ----------
-FROM --platform=$BUILDPLATFORM rust:1.95-slim-bookworm AS builder
+FROM --platform=$TARGETPLATFORM rust:1.95-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
@@ -12,7 +12,7 @@ COPY config.example.toml ./
 RUN cargo build --release
 
 # ---------- 运行阶段 ----------
-FROM debian:bookworm-slim
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim
 
 WORKDIR /app
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
