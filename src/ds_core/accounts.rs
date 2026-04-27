@@ -3,8 +3,9 @@
 //! 1 account = 1 session = 1 concurrency。多并发需横向扩展账号数。
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use crate::config::Account as AccountConfig;
 use crate::ds_core::client::{
@@ -12,7 +13,7 @@ use crate::ds_core::client::{
 };
 use crate::ds_core::pow::{PowError, PowSolver};
 use futures::TryStreamExt;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 /// 账号状态信息
 pub struct AccountStatus {
@@ -20,12 +21,20 @@ pub struct AccountStatus {
     pub mobile: String,
 }
 
+/// 单个 session 的状态：ID + 下次 edit_message 的 message_id
+struct SessionInfo {
+    id: String,
+    next_message_id: i64,
+}
+
 pub struct Account {
     token: String,
     email: String,
     mobile: String,
-    sessions: HashMap<String, String>,
+    sessions: RwLock<HashMap<String, SessionInfo>>,
     is_busy: AtomicBool,
+    /// 账号最近一次释放的时间戳（ms），用于冷却判断
+    last_released: AtomicI64,
 }
 
 impl Account {
@@ -33,8 +42,35 @@ impl Account {
         &self.token
     }
 
-    pub fn session_id(&self, model_type: &str) -> Option<&str> {
-        self.sessions.get(model_type).map(|s| s.as_str())
+    pub fn session_id(&self, model_type: &str) -> Option<String> {
+        self.sessions
+            .read()
+            .unwrap()
+            .get(model_type)
+            .map(|s| s.id.clone())
+    }
+
+    pub fn next_message_id(&self, model_type: &str) -> i64 {
+        self.sessions
+            .read()
+            .unwrap()
+            .get(model_type)
+            .map(|s| s.next_message_id)
+            .unwrap_or(1)
+    }
+
+    pub fn set_next_message_id(&self, model_type: &str, id: i64) {
+        if let Some(s) = self.sessions.write().unwrap().get_mut(model_type) {
+            s.next_message_id = id;
+        }
+    }
+
+    pub fn display_id(&self) -> &str {
+        if !self.email.is_empty() {
+            &self.email
+        } else {
+            &self.mobile
+        }
     }
 
     pub fn is_busy(&self) -> bool {
@@ -56,12 +92,16 @@ impl AccountGuard {
 impl Drop for AccountGuard {
     fn drop(&mut self) {
         self.account.is_busy.store(false, Ordering::Relaxed);
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        self.account.last_released.store(now_ms, Ordering::Relaxed);
     }
 }
 
 pub struct AccountPool {
     accounts: Vec<Arc<Account>>,
-    index: AtomicUsize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -87,7 +127,6 @@ impl AccountPool {
     pub fn new() -> Self {
         Self {
             accounts: Vec::new(),
-            index: AtomicUsize::new(0),
         }
     }
 
@@ -99,15 +138,20 @@ impl AccountPool {
         solver: &PowSolver,
     ) -> Result<(), PoolError> {
         use futures::future::join_all;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
 
-        // 全并发初始化所有账号
+        // 限制并发初始化数，避免对 DeepSeek 端和本地连接池造成压力
+        let semaphore = Arc::new(Semaphore::new(13));
         let futures: Vec<_> = creds
             .into_iter()
             .map(|creds| {
                 let client = client.clone();
                 let solver = solver.clone();
                 let model_types = model_types.clone();
+                let sem = semaphore.clone();
                 async move {
+                    let _permit = sem.acquire().await.expect("信号量未关闭");
                     let display_id = if creds.mobile.is_empty() {
                         creds.email.clone()
                     } else {
@@ -131,36 +175,49 @@ impl AccountPool {
         self.accounts = results.into_iter().flatten().collect();
 
         if self.accounts.is_empty() {
+            error!(target: "ds_core::accounts", "所有账号初始化失败");
             return Err(PoolError::AllAccountsFailed);
         }
 
         Ok(())
     }
 
-    /// 轮询获取一个空闲的账号（必须拥有指定 model_type 的 session）
+    /// 获取空闲最久的可用账号（必须拥有指定 model_type 的 session）
+    ///
+    /// 遍历所有账号，选冷却已过且空闲时间最长的那个，最大化每次使用间隔。
     pub fn get_account(&self, model_type: &str) -> Option<AccountGuard> {
         if self.accounts.is_empty() {
             return None;
         }
 
-        let idx = self.index.fetch_add(1, Ordering::Relaxed) % self.accounts.len();
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
 
-        for i in 0..self.accounts.len() {
-            let account = &self.accounts[(idx + i) % self.accounts.len()];
-            if account.session_id(model_type).is_some()
-                && !account.is_busy()
-                && account
-                    .is_busy
-                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                return Some(AccountGuard {
-                    account: account.clone(),
-                });
+        let mut best_idx: Option<usize> = None;
+        let mut best_idle = i64::MIN;
+
+        for (i, account) in self.accounts.iter().enumerate() {
+            if account.session_id(model_type).is_none() || account.is_busy() {
+                continue;
+            }
+            let idle = now_ms - account.last_released.load(Ordering::Relaxed);
+            if idle > best_idle {
+                best_idle = idle;
+                best_idx = Some(i);
             }
         }
 
-        None
+        let idx = best_idx?;
+        let account = &self.accounts[idx];
+        account
+            .is_busy
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .ok()?;
+        Some(AccountGuard {
+            account: Arc::clone(account),
+        })
     }
 
     /// 获取所有账号的详细状态
@@ -185,12 +242,15 @@ impl AccountPool {
                 let token = account.token().to_string();
                 account
                     .sessions
+                    .read()
+                    .unwrap()
                     .values()
+                    .map(|s| s.id.clone())
                     .map(move |session_id| {
                         let client = client.clone();
                         let token = token.clone();
                         async move {
-                            if let Err(e) = client.delete_session(&token, session_id).await {
+                            if let Err(e) = client.delete_session(&token, &session_id).await {
                                 warn!(
                                     target: "ds_core::accounts",
                                     "清理 session 失败 ({}): {}",
@@ -277,10 +337,16 @@ async fn try_init_account(
     );
     let token = login_data.user.token;
 
+    let display_id = if creds.mobile.is_empty() {
+        &creds.email
+    } else {
+        &creds.mobile
+    };
+
     let mut sessions = HashMap::new();
     for model_type in model_types {
         let session_id = client.create_session(&token).await?;
-        health_check(&token, &session_id, client, solver, model_type).await?;
+        health_check(&token, &session_id, client, solver, model_type, display_id).await?;
 
         let title_payload = UpdateTitlePayload {
             chat_session_id: session_id.clone(),
@@ -288,8 +354,16 @@ async fn try_init_account(
         };
         client.update_title(&token, &title_payload).await?;
 
-        sessions.insert(model_type.clone(), session_id);
+        sessions.insert(
+            model_type.clone(),
+            SessionInfo {
+                id: session_id,
+                next_message_id: 1,
+            },
+        );
     }
+
+    let sessions = RwLock::new(sessions);
 
     Ok(Account {
         token,
@@ -297,6 +371,7 @@ async fn try_init_account(
         mobile: creds.mobile.clone(),
         sessions,
         is_busy: AtomicBool::new(false),
+        last_released: AtomicI64::new(0),
     })
 }
 
@@ -306,8 +381,9 @@ async fn health_check(
     client: &DsClient,
     solver: &PowSolver,
     model_type: &str,
+    display_id: &str,
 ) -> Result<(), PoolError> {
-    debug!(target: "ds_core::accounts", "health_check model_type={}", model_type);
+    debug!(target: "ds_core::accounts", "health_check model_type={} account={}", model_type, display_id);
     let challenge = client.create_pow_challenge(token).await?;
 
     let result = solver.solve(&challenge)?;
@@ -330,6 +406,6 @@ async fn health_check(
         let _ = chunk;
     }
 
-    debug!(target: "ds_core::accounts", "health_check 完成 model_type={}", model_type);
+    debug!(target: "ds_core::accounts", "health_check 完成 model_type={} account={}", model_type, display_id);
     Ok(())
 }

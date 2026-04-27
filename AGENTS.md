@@ -1,5 +1,8 @@
 # CLAUDE.md
 
+> **Note**: This file serves dual duty as both `AGENTS.md` (the real file) and `CLAUDE.md` (symlink → `AGENTS.md`).
+> Edit `AGENTS.md` directly; `CLAUDE.md` stays in sync automatically.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Overview
@@ -44,11 +47,11 @@ Key dependencies and why they matter:
 ```
 src/
 ├── main.rs                      # Thin binary wrapper: init logger, load config, run server
-├── lib.rs                       # Public API boundary: exports Config, DeepSeekCore, OpenAIAdapter, AnthropicCompat
+├── lib.rs                       # Public API boundary: exports Config, DeepSeekCore, ChatResponse, OpenAIAdapter, ChatResult, AnthropicCompat
 ├── config.rs                    # Config loader: -c flag, config.toml default
 ├── ds_core.rs                   # DeepSeek facade: DeepSeekCore, CoreError; declares accounts/ client/ completions/ pow
 ├── ds_core/
-│   ├── accounts.rs              # Account pool: init validation, round-robin selection
+│   ├── accounts.rs              # Account pool: init validation, idle-aware (most-idle-first) selection
 │   ├── pow.rs                   # PoW solver: WASM loading, DeepSeekHashV1 computation
 │   ├── completions.rs           # Chat orchestration: SSE streaming, account guard
 │   └── client.rs                # Raw HTTP client: API endpoints, zero business logic
@@ -84,8 +87,9 @@ src/
 ```
 
 **Additional files not in src/**:
-- `examples/openai_adapter_cli/` — JSON request samples (basic_chat, reasoning_search, stop_sequence, stream_options, tool_call)
-- `examples/*-script.txt` — Scripted input for CLI examples
+- `config.example.toml` — authoritative configuration reference (all fields documented with examples)
+- `examples/adapter_cli.rs` + `examples/adapter_cli-script.txt` — unified protocol debug CLI (modes: `chat`, `raw`, `compare`, `concurrent N`, `status`, `models`/`model <id>`)
+- `examples/adapter_cli/` — JSON request samples (basic_chat, reasoning, reasoning_search, stop, stream, tool_call, tool_call_multi_turn, tool_call_parallel, tool_call_required, web_search)
 - `py-e2e-tests/` — Python e2e test suite using pytest + uv:
   - `openai_endpoint/` — OpenAI-compatible `/v1/chat/completions` tests
   - `anthropic_endpoint/` — Anthropic-compatible `/v1/messages` tests
@@ -104,7 +108,7 @@ This means the file tree does not directly map to the public API. To understand 
 ### Binary / Library Split
 
 - `main.rs` is a thin binary wrapper (~10 lines): init `env_logger`, parse CLI args, load config, call `server::run()`
-- `lib.rs` defines the public API surface: `Config`, `DeepSeekCore`, `OpenAIAdapter`, `AnthropicCompat`, `StreamResponse`, etc.
+- `lib.rs` defines the public API surface: `Config`, `DeepSeekCore`, `CoreError`, `ChatRequest`, `ChatResponse`, `AccountStatus`, `OpenAIAdapter`, `OpenAIAdapterError`, `ChatResult`, `StreamResponse`, `AnthropicCompat`
 - The crate can be built as both a library (`cargo build --lib`) and a binary (`cargo build --bin ds-free-api`)
 
 ### StreamResponse Type
@@ -128,7 +132,7 @@ This means the file tree does not directly map to the public API. To understand 
 `AccountGuard` marks an account as `busy` and automatically releases it on `Drop`. `GuardedStream` wraps the SSE stream with an `AccountGuard`, so the account is held busy until the stream is fully consumed or dropped. This binds account concurrency to stream lifetime without explicit cleanup logic.
 
 ### Account Initialization Flow
-`AccountPool::init()` spins up all accounts concurrently. Per-account initialization (`try_init_account`) follows:
+`AccountPool::init()` spins up all accounts concurrently (capped at 13 via `tokio::sync::Semaphore`). Per-account initialization (`try_init_account`) follows:
 1. `login` — obtain Bearer token
 2. `create_session` — create chat session
 3. `health_check` — send a test completion (with PoW) to verify the session is writable
@@ -190,7 +194,10 @@ The adapter injects tool definitions as natural language into the prompt and par
 Random base64 padding in SSE chunks to reach a target response size (~512 bytes), controlled by `stream_options.include_obfuscation` (defaults to true).
 
 ### Overloaded Retry
-`OpenAIAdapter::try_chat()` retries up to 3 times with 200ms delay on `CoreError::Overloaded`.
+`OpenAIAdapter::try_chat()` retries up to **6 times** with **exponential backoff** (1s → 2s → 4s → 8s → 16s) on `CoreError::Overloaded`, which is triggered by DeepSeek's `rate_limit_reached` SSE hint or when all accounts are busy.
+
+### request_id & x-ds-account
+Each request gets a `req-{n}` ID generated at the handler, threaded down through adapter → ds_core. Key log points carry `req=` for `grep`-able cross-layer tracing. The `x-ds-account` HTTP response header (set via `SseBody::with_header()`) carries the account identifier upstream from ds_core through `ChatResponse` / `ChatResult<T>` wrappers.
 
 ### HTTP Routes
 **OpenAI-compatible:**
@@ -226,8 +233,13 @@ Optional Bearer token auth via `[[server.api_tokens]]` in config; no auth when e
 | OpenAI protocol types | `src/openai_adapter/types.rs` | Request/response structs, `#![allow(dead_code)]` |
 | Model listing | `src/openai_adapter/models.rs` | Model registry and listing |
 | HTTP server/routes | `src/server/` | handlers → stream → error |
-| CLI examples | `examples/ds_core_cli.rs`, `examples/openai_adapter_cli.rs` | Interactive and script modes |
-| Example request JSON | `examples/openai_adapter_cli/` | Pre-built ChatCompletionRequest samples |
+| Unified debug CLI | `examples/adapter_cli.rs` + `examples/adapter_cli-script.txt` | Modes: chat/raw/compare/concurrent/status/models |
+| Example request JSON | `examples/adapter_cli/` | Pre-built ChatCompletionRequest samples (chat, stream, stop, reasoning, web_search, tool_call, etc.) |
+| Scripted regression test | `just adapter-cli -- source examples/adapter_cli-script.txt` | Runs all JSON samples in sequence |
+| Stress test scripts | `py-e2e-tests/stress_test_tools_openai.py`, `py-e2e-tests/stress_test_tools_anthropic.py` | Load testing for OpenAI and Anthropic endpoints |
+| CI pipeline | `.github/workflows/ci.yml` | `cargo check + clippy + fmt + audit + machete` and `cargo test` |
+| Release workflow | `.github/workflows/release.yml` | Tag `v*` triggers multi-platform build (8 targets, 4 OS) + CHANGELOG release notes |
+| Claude config | `AGENTS.md` | Agent delegation patterns for this repo |
 | Code style / logging | `docs/code-style.md`, `docs/logging-spec.md` | Comments, naming, targets, levels |
 | API reference | `docs/deepseek-api-reference.md` | DeepSeek endpoint details |
 
@@ -272,6 +284,12 @@ cp config.example.toml config.toml
 # One-pass check (check + clippy + fmt + audit + unused deps)
 just check
 
+# Pre-commit hook runs check + clippy + fmt + audit + machete + cargo test --lib
+# (see .git/hooks/pre-commit — matches CI order)
+
+# Trace through the entire SSE pipeline
+RUST_LOG=adapter=trace,ds_core::accounts=debug,info just serve
+
 # Run the HTTP server
 just serve
 RUST_LOG=debug just serve
@@ -280,13 +298,13 @@ RUST_LOG=debug just serve
 RUST_LOG=ds_core::accounts=debug,ds_core::client=warn,info just serve
 RUST_LOG=adapter=debug,anthropic_compat=debug just serve
 
-# Run ds_core_cli example
-just ds-core-cli
-RUST_LOG=debug just ds-core-cli
-just ds-core-cli -- source examples/ds_core_cli-script.txt
-
-# Run openai_adapter_cli example
-just openai-adapter-cli
+# Run unified protocol debug CLI (modes: chat, raw, compare, concurrent N, status, models, model <id>)
+just adapter-cli
+RUST_LOG=debug just adapter-cli
+# Script mode — runs all JSON samples in sequence (full regression)
+just adapter-cli -- source examples/adapter_cli-script.txt
+# Interactive mode with a specific config
+cargo run --example adapter_cli -- -c /path/to/config.toml
 
 # Run specific test modules (pass test name filter and args)
 just test-adapter-request
@@ -305,6 +323,10 @@ cargo test --lib
 # Run Python e2e tests (requires `uv` and server running on port 5317)
 just e2e
 
+# Stress tests (in py-e2e-tests/, against a running server)
+uv run python py-e2e-tests/stress_test_tools_openai.py
+uv run python py-e2e-tests/stress_test_tools_anthropic.py
+
 # Start server with e2e test config
 just e2e-serve
 
@@ -318,4 +340,10 @@ cargo machete      # requires: cargo install cargo-machete
 # Build
 cargo build
 cargo build --release
+
+# Release (tag push triggers CI: 8 targets x 4 platforms via cross)
+git tag v0.x.x
+git push origin v0.x.x
+# CI extracts changelog from CHANGELOG.md, creates GitHub release
+
 ```

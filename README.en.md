@@ -19,9 +19,15 @@
 
 [中文](README.md)
 
-Reverse proxy and adapter for free DeepSeek web chat endpoints to standard OpenAI-compatible and Anthropic-compatible API protocols (currently supports chat completions and messages, including streaming and tool calls).
+Reverse proxy that adapts and converts free DeepSeek web chat into standard OpenAI / Anthropic compatible API protocols (currently supports chat completions and messages, including streaming and tool calls).
 
-Cross-platform native Rust binary + single TOML config file.
+## Highlights
+
+- **Zero-cost API proxy**: Uses DeepSeek's free web chat — no official API key required, drop-in replacement for OpenAI / Anthropic clients
+- **Dual protocol**: OpenAI Chat Completions + Anthropic Messages API, works with existing tools and SDKs
+- **Tool call ready**: Full function calling support with XML parsing and three-tier self-repair pipeline (text fixes → JSON repair → live model fallback), covering 10+ malformed formats
+- **Rust implementation**: Single binary + single TOML config, cross-platform native performance
+- **Multi-account pool**: Most-idle-first rotation, automatic session management, horizontal concurrency scaling
 
 ## Quick Start
 
@@ -53,7 +59,17 @@ Copy `config.example.toml` to `config.toml` in the same directory as the executa
 RUST_LOG=debug ./ds-free-api
 ```
 
-Required fields only. One account = one concurrency slot (seems max 2 concurrent).
+Required fields only. One account = one concurrency slot.
+
+> **Concurrency**: DeepSeek's free API enforces rate limits per session (`Messages too frequent. Try again later.`). This project includes built-in mechanisms for stable operation:
+> - **Auto rate-limit detection**: Monitors SSE `hint` events for `rate_limit` signals
+> - **Exponential backoff retry**: Automatically retries with 1s→2s→4s→8s→16s intervals (up to 6 attempts)
+> - **Smart `stop_stream`**: Only fires on client disconnect, skipped on normal completion — prevents request conflicts
+> - **Dynamic message_id tracking**: Parses real session IDs from SSE `ready` events, supporting multiple edits within the same session
+>
+> Verified: 4 accounts + 2 concurrent workers pass all stress scenarios at 100%. 4 accounts + 4 concurrent workers also pass all e2e tests consistently. A single account can also pass all tests thanks to the retry mechanism.
+>
+> While the system guarantees minimum parallelism = number of accounts (no lock contention), **parallelism = accounts / 2 is recommended** to avoid excessive internal retry latency.
 
 ```toml
 [server]
@@ -118,9 +134,8 @@ The Anthropic compatibility layer uses the same model IDs, accessed via `/anthro
 
 ### Capability Toggles
 
-- **Reasoning**: Enabled by default. To disable, add `"reasoning_effort": "none"` to the request body.
+- **Reasoning**: Enabled by default. To explicitly disable, add `"reasoning_effort": "none"` to the request body.
 - **Web search**: Disabled by default. To enable, add `"web_search_options": {"search_context_size": "high"}`.
-- **Tool calls**: Pass standard OpenAI `tools` and `tool_choice` fields. When the model decides to call a tool, the returned `finish_reason` will be `tool_calls`.
 
 ## Development
 
@@ -136,18 +151,19 @@ cargo test
 # Run HTTP server
 just serve
 
-# CLI examples
-just ds-core-cli
-just openai-adapter-cli
+# Unified protocol debug CLI
+just adapter-cli
 
-# Python e2e tests (requires server running on port 5317)
-just e2e
+# e2e tests (requires server running on port 5317, orthogonal scenarios)
+just e2e-basic    # Basic functional (dual endpoints)
+just e2e-repair   # Tool call repair scenarios
+just e2e-stress   # Multi-iteration stress (all scenarios)
 
 # Start server with e2e test config
 just e2e-serve
 ```
 
-Architecture overview:
+### Architecture overview:
 
 ```mermaid
 flowchart TB
@@ -212,19 +228,48 @@ flowchart TB
     style CL fill:#f0fdf4,stroke:#22c55e,stroke-width:2px
 ```
 
-Data pipelines:
+### Data pipelines:
 
 - **OpenAI request**: `JSON body` → `normalize` validation/defaults → `tools` extraction → `prompt` ChatML build → `resolver` model mapping → `ChatRequest`
 - **OpenAI response**: `DeepSeek SSE bytes` → `sse_parser` → `state` patch state machine → `converter` format conversion → `tool_parser` XML parsing → `StopStream` truncation → `OpenAI SSE bytes`
 - **Anthropic request**: `Anthropic JSON` → `to_openai_request()` → enters OpenAI request pipeline
 - **Anthropic response**: OpenAI output → `from_chat_completion_stream()` / `from_chat_completion_bytes()` → `Anthropic SSE/JSON`
 
+### e2e tests
+
+`py-e2e-tests/` is a JSON scenario-driven e2e test framework (requires `uv`). Three tiers:
+
+| Tier | Command | Coverage |
+|------|---------|----------|
+| **Basic** | `just e2e-basic` | Core scenarios (dual endpoint OpenAI + Anthropic), safe concurrency |
+| **Repair** | `just e2e-repair` | Malformed tool call repair scenarios (OpenAI only), safe concurrency |
+| **Stress** | `just e2e-stress` | All scenarios × 3 iterations, safe concurrency + 1 |
+
+Scenarios organized by type under `scenarios/`:
+
+```
+py-e2e-tests/
+├── scenarios/
+│   ├── basic/
+│   │   ├── openai/         # Core scenarios (chat, reasoning, streaming, tool calls)
+│   │   └── anthropic/      # Core scenarios (chat, reasoning, tool calls)
+│   └── repair/             # Malformed tool call repair scenarios
+├── runner.py               # Single-run entry point
+└── stress_runner.py        # Multi-iteration stress entry point
+```
+
+Safe concurrency is calculated from `config.toml` account count (`max(1, accounts ÷ 2)`), api_key is auto-extracted.
+
+**Recommended**: Run e2e tests before submitting a PR.
+
 ## License
 
 [Apache License 2.0](LICENSE)
 
-DeepSeek's official API is very affordable. Please support the official service.
+[DeepSeek official API](https://platform.deepseek.com/top_up) is very affordable. Please support the official service.
 
 This project was created to experiment with the latest models in DeepSeek's web A/B testing.
 
 **Commercial use is strictly prohibited** to avoid putting pressure on official servers. Use at your own risk.
+
+~~DeepSeek is still China's number one model!!!~~

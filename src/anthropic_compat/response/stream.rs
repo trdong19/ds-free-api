@@ -35,11 +35,13 @@ struct ContentBlockStartEvent {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-#[allow(clippy::enum_variant_names)]
 enum ContentBlockDelta {
-    TextDelta { text: String },
-    ThinkingDelta { thinking: String },
-    InputJsonDelta { partial_json: String },
+    #[serde(rename = "text_delta")]
+    Text { text: String },
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
+    #[serde(rename = "input_json_delta")]
+    InputJson { partial_json: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -263,7 +265,7 @@ impl StreamState {
             }
             events.push(StreamEvent::ContentBlockDelta {
                 index: self.block_index,
-                delta: ContentBlockDelta::ThinkingDelta {
+                delta: ContentBlockDelta::Thinking {
                     thinking: text.clone(),
                 },
             });
@@ -284,7 +286,7 @@ impl StreamState {
             }
             events.push(StreamEvent::ContentBlockDelta {
                 index: self.block_index,
-                delta: ContentBlockDelta::TextDelta { text: text.clone() },
+                delta: ContentBlockDelta::Text { text: text.clone() },
             });
         }
 
@@ -314,7 +316,7 @@ impl StreamState {
                 });
                 events.push(StreamEvent::ContentBlockDelta {
                     index: self.block_index,
-                    delta: ContentBlockDelta::InputJsonDelta { partial_json },
+                    delta: ContentBlockDelta::InputJson { partial_json },
                 });
                 events.push(StreamEvent::ContentBlockStop {
                     index: self.block_index,
@@ -390,16 +392,14 @@ impl StreamEvent {
                     ty: "content_block_delta",
                     index: *index,
                     delta: match delta {
-                        ContentBlockDelta::TextDelta { text } => {
-                            ContentBlockDelta::TextDelta { text: text.clone() }
+                        ContentBlockDelta::Text { text } => {
+                            ContentBlockDelta::Text { text: text.clone() }
                         }
-                        ContentBlockDelta::ThinkingDelta { thinking } => {
-                            ContentBlockDelta::ThinkingDelta {
-                                thinking: thinking.clone(),
-                            }
-                        }
-                        ContentBlockDelta::InputJsonDelta { partial_json } => {
-                            ContentBlockDelta::InputJsonDelta {
+                        ContentBlockDelta::Thinking { thinking } => ContentBlockDelta::Thinking {
+                            thinking: thinking.clone(),
+                        },
+                        ContentBlockDelta::InputJson { partial_json } => {
+                            ContentBlockDelta::InputJson {
                                 partial_json: partial_json.clone(),
                             }
                         }

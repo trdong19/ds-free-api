@@ -21,6 +21,7 @@ const ENDPOINT_CHAT_SESSION_UPDATE_TITLE: &str = "/chat_session/update_title";
 const ENDPOINT_CHAT_CREATE_POW_CHALLENGE: &str = "/chat/create_pow_challenge";
 const ENDPOINT_CHAT_COMPLETION: &str = "/chat/completion";
 const ENDPOINT_CHAT_EDIT_MESSAGE: &str = "/chat/edit_message";
+const ENDPOINT_CHAT_STOP_STREAM: &str = "/chat/stop_stream";
 #[allow(dead_code)]
 const ENDPOINT_FILE_UPLOAD: &str = "/file/upload_file";
 #[allow(dead_code)]
@@ -179,6 +180,12 @@ pub struct EditMessagePayload {
 pub struct UpdateTitlePayload {
     pub chat_session_id: String,
     pub title: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StopStreamPayload {
+    pub chat_session_id: String,
+    pub message_id: i64,
 }
 
 #[derive(Clone)]
@@ -389,6 +396,23 @@ impl DsClient {
             .send()
             .await?;
         Self::parse_envelope::<serde::de::IgnoredAny>(resp).await?;
+        Ok(())
+    }
+
+    /// 取消正在进行的流式输出，不需要 PoW
+    pub async fn stop_stream(
+        &self,
+        token: &str,
+        payload: &StopStreamPayload,
+    ) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_STOP_STREAM))
+            .headers(self.auth_headers(token)?)
+            .json(payload)
+            .send()
+            .await?;
+        Self::parse_envelope::<Option<()>>(resp).await?;
         Ok(())
     }
 

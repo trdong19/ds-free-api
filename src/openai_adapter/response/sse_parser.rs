@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::Stream;
 use pin_project_lite::pin_project;
 
-use log::debug;
+use log::{trace, warn};
 
 use crate::openai_adapter::OpenAIAdapterError;
 
@@ -19,8 +19,7 @@ pub struct SseEvent {
 }
 
 pin_project! {
-    #[allow(unused_doc_comments)]
-    /// 包装底层字节流，将其切分为独立的 SSE 事件
+    // 包装底层字节流，将其切分为独立的 SSE 事件
     pub struct SseStream<S> {
         #[pin]
         inner: S,
@@ -56,11 +55,12 @@ where
                     this.raw_buf.extend_from_slice(&bytes);
                     decode_utf8_prefix(this.raw_buf, this.text_buf);
                     if let Some(evt) = try_pop_event(this.text_buf) {
+                        trace!(target: "adapter", "<<< {} {}", evt.event.as_deref().unwrap_or("-"), evt.data);
                         return Poll::Ready(Some(Ok(evt)));
                     }
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    debug!(target: "adapter", "SSE 流错误: {}", e);
+                    warn!(target: "adapter", "SSE 流错误: {}", e);
                     return Poll::Ready(Some(Err(OpenAIAdapterError::Internal(format!(
                         "SSE 流错误: {}",
                         e

@@ -6,6 +6,8 @@ use std::task::{Context, Poll};
 use futures::Stream;
 use pin_project_lite::pin_project;
 
+use log::trace;
+
 use crate::openai_adapter::OpenAIAdapterError;
 use crate::openai_adapter::types::{ChatCompletionChunk, ChunkChoice, Delta, Usage};
 
@@ -35,7 +37,11 @@ fn make_usage(prompt_tokens: u32, completion_tokens: u32) -> Usage {
     }
 }
 
-fn make_chunk(model: &str, delta: Delta, finish: Option<&'static str>) -> ChatCompletionChunk {
+pub(crate) fn make_chunk(
+    model: &str,
+    delta: Delta,
+    finish: Option<&'static str>,
+) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: next_chatcmpl_id(),
         object: "chat.completion.chunk",
@@ -54,8 +60,7 @@ fn make_chunk(model: &str, delta: Delta, finish: Option<&'static str>) -> ChatCo
 }
 
 pin_project! {
-    #[allow(unused_doc_comments)]
-    /// 将 DsFrame 增量帧映射为 OpenAI ChatCompletionChunk 的流转换器
+    // 将 DsFrame 增量帧映射为 OpenAI ChatCompletionChunk 的流转换器
     pub struct ConverterStream<S> {
         #[pin]
         inner: S,
@@ -113,6 +118,7 @@ where
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(frame))) => match frame {
                     DsFrame::Role => {
+                        trace!(target: "adapter", ">>> conv: role=assistant");
                         return Poll::Ready(Some(Ok(make_chunk(
                             this.model,
                             Delta {
@@ -123,6 +129,7 @@ where
                         ))));
                     }
                     DsFrame::ThinkDelta(text) => {
+                        trace!(target: "adapter", ">>> conv: thinking len={}", text.len());
                         return Poll::Ready(Some(Ok(make_chunk(
                             this.model,
                             Delta {
@@ -133,6 +140,7 @@ where
                         ))));
                     }
                     DsFrame::ContentDelta(text) => {
+                        trace!(target: "adapter", ">>> conv: content delta len={}", text.len());
                         return Poll::Ready(Some(Ok(make_chunk(
                             this.model,
                             Delta {
@@ -143,6 +151,7 @@ where
                         ))));
                     }
                     DsFrame::Status(status) if status == "FINISHED" && !*this.finished => {
+                        trace!(target: "adapter", ">>> conv: finish=stop");
                         *this.finished = true;
                         return Poll::Ready(Some(Ok(make_chunk(
                             this.model,
@@ -152,6 +161,7 @@ where
                     }
                     DsFrame::Status(_) => {}
                     DsFrame::Usage(u) => {
+                        trace!(target: "adapter", ">>> conv: usage={}", u);
                         *this.usage_value = Some(u);
                         if *this.finished && *this.include_usage {
                             return Poll::Ready(Some(Ok(make_usage_chunk(
@@ -161,6 +171,7 @@ where
                         }
                     }
                     DsFrame::Finish if !*this.finished => {
+                        trace!(target: "adapter", ">>> conv: finish=stop");
                         *this.finished = true;
                         return Poll::Ready(Some(Ok(make_chunk(
                             this.model,

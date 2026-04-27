@@ -347,10 +347,32 @@ data: {"click_behavior":"none","auto_resume":false}
 }
 ```
 - Response: 同 `completion`（SSE 流）
-- 注意: `message_id` 必须已存在（空 session 的 `message_id=1` 会返回 `biz_code=26, "invalid message id"`）。编辑后生成新的 `message_id`（原 `message_id` 的 `parent_id` 指向编辑前的消息）
+- 注意: `message_id` 必须已存在（空 session 的 `message_id=1` 会返回 `biz_code=26, "invalid message id"`）。编辑后生成新的 `message_id`，需从 SSE `ready` 事件中获取 `response_message_id` 字段用于后续 `stop_stream`
+- 实际抓包确认：首次 `edit_message(message_id=1)` 的 `response_message_id=4`（而非 2），后续对话按 `1→4, 3→6, 5→8...` 递增
 
 
-## 6. delete
+## 6. stop_stream
+- url: https://chat.deepseek.com/api/v0/chat/stop_stream
+- Request Header:
+  - `Authorization: Bearer <token>`
+  - `User-Agent`: 必填（WAF 绕过）
+- Request Payload:
+```json
+{
+    "chat_session_id": "57bf7fb1-5fde-4d21-a08e-5dfa017216d5",
+    "message_id": 2
+}
+```
+  - `chat_session_id`: 来自 create 端点的 session ID
+  - `message_id`: 要取消的响应消息 ID。编辑请求的 `message_id=1` 对应响应 `message_id=2`，所以停止流固定传 `2`。
+- Response:
+```json
+{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":null}}
+```
+- 作用: 取消正在进行的流式输出。客户端断开连接后调用此端点可让 DeepSeek 侧停止继续生成，避免浪费资源。
+- 注意: 不需要 PoW header
+
+## 7. delete
 - url: https://chat.deepseek.com/api/v0/chat_session/delete
 - Request Header:
   - `Authorization: Bearer <token>`
@@ -362,7 +384,7 @@ data: {"click_behavior":"none","auto_resume":false}
 ```
 
 
-## 7. update_title
+## 8. update_title
 - url: https://chat.deepseek.com/api/v0/chat_session/update_title
 - Request Header:
   - `Authorization: Bearer <token>`
@@ -393,7 +415,7 @@ data: {"click_behavior":"none","auto_resume":false}
 
 
 
-## 8. upload_file
+## 9. upload_file
 - url: https://chat.deepseek.com/api/v0/file/upload_file
 - Request Header:
   - `Authorization: Bearer <token>`
@@ -431,7 +453,7 @@ Content-Type: text/plain
 
 
 
-## 9. fetch_files?file_ids=<id>
+## 10. fetch_files?file_ids=<id>
 - url: https://chat.deepseek.com/api/v0/file/fetch_files?file_ids=<id>
 - Request Header:
   - `Authorization: Bearer <token>`

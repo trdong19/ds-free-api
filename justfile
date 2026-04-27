@@ -11,9 +11,10 @@ check:
   cargo audit
   cargo machete
 
-# Run ds_core_cli example
-ds-core-cli *ARGS:
-  cargo run --example ds_core_cli -- "$@"
+# Run unified protocol debug CLI (replaces ds-core-cli / openai-adapter-cli)
+# 默认使用 py-e2e-tests/config.toml，可通过 -c <path> 覆盖
+adapter-cli *ARGS:
+  cargo run --example adapter_cli -- -c py-e2e-tests/config.toml "$@"
 
 # Run openai_adapter/request submodule tests
 test-adapter-request *ARGS:
@@ -23,18 +24,21 @@ test-adapter-request *ARGS:
 test-adapter-response *ARGS:
   cargo test openai_adapter::response -- "$@"
 
-# Run openai_adapter_cli example
-openai-adapter-cli *ARGS:
-  cargo run --example openai_adapter_cli -- "$@"
-
 # Run HTTP server
 serve *ARGS:
   cargo run -- "$@"
 
-# Run Python e2e tests (requires server running; will skip with hint if not)
-# -n 2: 并发测试（DeepSeek 免费 API 不支持更高并发，4 workers 会触发大量空响应）
-e2e *ARGS:
-  cd py-e2e-tests && uv run python -m pytest -n 2 "$@"
+# Basic: 基础功能测试（两端点）
+e2e-basic *ARGS:
+  cd py-e2e-tests && uv run python runner.py scenarios/basic "$@"
+
+# Repair: 工具调用损坏修复专项测试
+e2e-repair *ARGS:
+  cd py-e2e-tests && uv run python runner.py scenarios/repair "$@"
+
+# Stress: 多迭代并发压测（basic + repair 全部场景）
+e2e-stress *ARGS:
+  cd py-e2e-tests && uv run python stress_runner.py "$@"
 
 # Start server with e2e test config
 e2e-serve:

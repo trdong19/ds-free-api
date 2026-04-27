@@ -6,6 +6,8 @@ use std::task::{Context, Poll};
 use futures::Stream;
 use pin_project_lite::pin_project;
 
+use log::{trace, warn};
+
 use crate::openai_adapter::OpenAIAdapterError;
 
 use super::sse_parser::SseEvent;
@@ -136,6 +138,20 @@ impl DsState {
             "response/status" => {
                 if let Some(s) = val.as_str() {
                     self.status = Some(s.to_string());
+                    if s == "FINISHED" {
+                        let has_response = self
+                            .fragments
+                            .iter()
+                            .any(|f| f.ty == "RESPONSE" && !f.content.is_empty());
+                        if !has_response {
+                            warn!(
+                                target: "adapter",
+                                "状态机 FINISHED 但无 RESPONSE 内容: fragments={:?}, status={:?}, accumulated_token_usage={:?}",
+                                self.fragments.iter().map(|f| format!("{}/{}", f.ty, f.content.len())).collect::<Vec<_>>(),
+                                self.status, self.accumulated_token_usage
+                            );
+                        }
+                    }
                     frames.push(DsFrame::Status(s.to_string()));
                 }
             }
@@ -203,8 +219,7 @@ impl DsState {
 }
 
 pin_project! {
-    #[allow(unused_doc_comments)]
-    /// 对 SSE 事件流应用 patch 状态机的包装流
+    // 对 SSE 事件流应用 patch 状态机的包装流
     pub struct StateStream<S> {
         #[pin]
         inner: S,
@@ -247,6 +262,7 @@ where
                     }
                     let mut frames = frames;
                     let first = frames.remove(0);
+                    trace!(target: "adapter", ">>> state: {}", trace_frame(&first));
                     // 剩余帧按正序压入 pending（先压后出的会逆序，所以逆序 extend）
                     this.pending.extend(frames.into_iter().rev());
                     return Poll::Ready(Some(Ok(first)));
@@ -258,6 +274,26 @@ where
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+/// TRACE 日志用：截断长文本，其余变体直接 Debug
+fn trace_frame(frame: &DsFrame) -> String {
+    const MAX_LEN: usize = 60;
+    match frame {
+        DsFrame::ContentDelta(s) | DsFrame::ThinkDelta(s) => {
+            let ty = if matches!(frame, DsFrame::ContentDelta(_)) {
+                "ContentDelta"
+            } else {
+                "ThinkDelta"
+            };
+            if s.len() > MAX_LEN {
+                format!("{}(\"{}\")", ty, &s[..MAX_LEN])
+            } else {
+                format!("{:?}", frame)
+            }
+        }
+        _ => format!("{:?}", frame),
     }
 }
 
