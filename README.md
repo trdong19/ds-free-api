@@ -27,7 +27,7 @@
 - **双协议支持**：同时兼容 OpenAI Chat Completions 与 Anthropic Messages API，主流客户端即插即用
 - **工具调用就绪**：OpenAI function calling 完整实现，XML 解析 + 三层自修复管道（文本修复 → JSON 修复 → 模型兜底），覆盖 10+ 异常格式
 - **Rust 实现**：单可执行文件 + 单 TOML 配置，跨平台原生高性能
-- **多账号池**：空闲最久优先轮转，自动 Session 管理，支持水平扩展并发
+- **多账号池**：空闲最久优先轮转，支持水平扩展并发
 
 ## 快速开始
 
@@ -65,9 +65,8 @@ RUST_LOG=debug ./ds-free-api
 > - **限流自动检测**：监听 SSE `hint` 事件中的 `rate_limit` 信号，快速识别限流
 > - **指数退避重试**：检测到限流后自动重试，间隔为 1s→2s→4s→8s→16s，最多 6 次
 > - **`stop_stream` 智能触发**：仅在客户端主动断连时调用，正常完成时跳过，避免请求冲突
-> - **动态 message_id 追踪**：从 SSE `ready` 事件中解析实际会话 ID，支持同一 session 内多次编辑
 >
-> 尽管系统已保证最低并行数 = 账号数（无锁争用），但为避免内部重试延迟过高，**推荐并行数 = 账号数 ÷ 2**。实测 4 账号 + 2 并发可 100% 通过全部压测场景，4 账号 + 4 并发也能稳定通过全部 e2e 测试。单账号 + 单并发在上述重试机制下也可跑通。
+> **推荐并行数 = 账号数 ÷ 2**。实测 4 账号 + 2 并发可 100% 通过全部压测场景。单账号 + 单并发在上述重试机制下也可跑通。
 
 ```toml
 [server]
@@ -198,6 +197,7 @@ flowchart TB
         Pool["🔄 账号池轮转"]:::core
         Pow["⛏️ PoW 求解"]:::core
         Chat["💬 对话编排"]:::core
+        Upload["📄 历史文件上传"]:::core
     end
 
     DeepSeek[("🔴 DeepSeek API")]:::external
@@ -210,7 +210,8 @@ flowchart TB
     ReqParse --> Pool
     Pool --> Pow
     Pow --> Chat
-    Chat -->|"DeepSeek 内部协议"| DeepSeek
+    Chat -->|"拆分多轮历史"| Upload
+    Upload -->|"completion + 文件引用"| DeepSeek
 
     %% ========== 响应链路（虚线 -.-→） ==========
     Chat -.->|"SSE 数据流"| RespTrans

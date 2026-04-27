@@ -189,13 +189,15 @@
     "parent_message_id": null,
     "model_type": "default",
     "prompt": "你好",
+    "ref_file_ids": ["file-xxx"],
     "thinking_enabled": true,
     "search_enabled": true,
     "preempt": false
 }
 ```
 - `model_type`: `"expert"` (默认) | `"default"` | 等
-- **注意**: 当前内核实现已移除 `ref_file_ids` 文件上传支持，文件处理请在外部完成
+- `ref_file_ids`: 上传文件后返回的文件 ID 数组，会话级别记忆，后续 `edit_message` 无需重复传入
+- `preempt`: 预占模式（目前网页端未使用），默认 false
 - Response: `text/event-stream` SSE 流
 
 ### SSE 事件格式
@@ -308,7 +310,19 @@ type == "RESPONSE"  → 实际输出内容
 
 **实现建议：** 解析 SSE 流时，维护一个 `current_path` 状态变量。当 `p` 字段出现时更新它，后续的 `{"v":"..."}` 或 `{"o":"APPEND","v":"..."}` 都归属到该路径。对于 `fragments/-1`，表示数组最后一个元素。
 
-**4. 流结束序列（按顺序）:**
+**4. `hint` — 服务端提示/错误（必处理）**
+```
+event: hint
+data: {"type":"error","content":"Content is too long. Please shorten it and try again.","clear_response":true,"finish_reason":"input_exceeds_limit"}
+```
+- `type`: `"error"` 表示错误提示，其他值（如 `"info"`）可忽略
+- `content`: 人类可读的提示信息
+- `clear_response`: 为 true 时表示已有输出应被清除
+- `finish_reason`: `"input_exceeds_limit"`（输入超长）、`"rate_limit_reached"`（限流）等
+
+**注意**: hint 事件固定为第二个 SSE 事件（紧接在 `ready` 之后）。流处理器应检查第二个事件是否为 `type=error` 的 hint，若是则主动终止流并返回错误（如 `Overloaded` 或 `BadRequest`），而非继续等待后续事件。
+
+**5. 流结束序列（按顺序）:**
 
 ```
 data: {"p":"response/status","v":"FINISHED"}
@@ -325,6 +339,9 @@ data: {"content":"Greeting Assistance"}
 event: close
 data: {"click_behavior":"none","auto_resume":false}
 ```
+
+- `close`: 会话语义结束信号。`click_behavior` 控制点击行为（`"none"` 或 `"retry"`），`auto_resume` 表示是否可自动恢复
+- `title`: 仅在 thinking=OFF 且 search=OFF 时出现，表示自动生成的会话标题
 
 注意: `event: title` 和 `event: close` 可能不总是出现。最可靠的结束信号是 `event: finish` 或 `response/status` 变为 `FINISHED`。
 
@@ -346,9 +363,11 @@ data: {"click_behavior":"none","auto_resume":false}
     "thinking_enabled": true
 }
 ```
-- Response: 同 `completion`（SSE 流）
-- 注意: `message_id` 必须已存在（空 session 的 `message_id=1` 会返回 `biz_code=26, "invalid message id"`）。编辑后生成新的 `message_id`，需从 SSE `ready` 事件中获取 `response_message_id` 字段用于后续 `stop_stream`
+- **注意**: `model_type` 和 `ref_file_ids` 不在 edit_message payload 中——二者在首次 completion 时传入后由 session 级别记忆，后续 edit_message 继承
+- `message_id`: 必须已存在（空 session 的 `message_id=1` 会返回 `biz_code=26, "invalid message id"`）
+- 编辑后生成新的 `message_id`，需从 SSE `ready` 事件中获取 `response_message_id` 字段用于后续 `stop_stream`
 - 实际抓包确认：首次 `edit_message(message_id=1)` 的 `response_message_id=4`（而非 2），后续对话按 `1→4, 3→6, 5→8...` 递增
+- Response: 同 `completion`（SSE 流）
 
 
 ## 6. stop_stream

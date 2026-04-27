@@ -4,74 +4,57 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.2.4] - 2026-04-26
+## [0.2.4] - 2026-04-27
 
 ### Added
-- **限流自动检测与指数退避重试**：ds_core 在发送流给 adapter 前先消费前两个 SSE 事件，
-  检测到 `hint` + `rate_limit_reached` 时返回 `CoreError::Overloaded`，
-  `try_chat()` 以 1s→2s→4s→8s→16s 指数间隔自动重试（最多 6 次），session 状态不受污染
-- **`stop_stream` 端点集成**：添加 `DsClient::stop_stream()` 方法，在 `GuardedStream` 的
-  `PinnedDrop` 中当流被提前丢弃时自动调用，通知 DeepSeek 端停止生成
-- **动态 message_id 追踪**：从 SSE `ready` 事件中解析 `request_message_id` 和
-  `response_message_id`，支持同一 session 内多次编辑，替代硬编码值
-- **SessionInfo 结构**：将 `sessions` 从 `HashMap<String, String>` 升级为
-  `RwLock<HashMap<String, SessionInfo>>`，每个 session 独立追踪 `next_message_id`
-- **`finished` 标记**：`GuardedStream` 仅在流未自然完成时触发 `stop_stream`，
-  正常完成不再发送停止信号
-- **工具调用自修复（live model fallback）**：当 tool_calls XML 解析失败时，
-  使用 DeepSeek 模型自身修复损坏的 JSON，提升工具调用稳定性
-- **`aggregate()` 透传修复管道**：非流式请求现在也走完整的 tool_calls 修复流程，
-  不再跳过 `repair_fn`，流式与非流式行为一致
-- **`parse_tool_calls` arguments 类型归一**：当 arguments 是 JSON 字符串而非对象时，
-  自动解析为对象后重新序列化，避免双重转义导致客户端解析错误
-- **request_id 跨层日志追踪**：在 handler 入口生成 `req-{n}` 标识，沿 adapter → ds_core
-  逐层传递，关键日志带 `req=` 前缀，`grep req=xxx` 可追踪单次请求全链路
-- **x-ds-account 响应头**：通过 `ChatResult<T>` / `ChatResponse` 将 `account_id` 从
-  ds_core 回流到 handler，注入 HTTP 响应头，方便客户端识别处理请求的账号
-- **SseBody `with_header()` 构建器**：支持流式响应中注入自定义 HTTP 响应头
-- **TRACE 日志贯穿流管道**：state → converter → repair → stop 各层增加 `>>> stage: ...`
-  格式的 TRACE 日志，配合 SSE 层的 `<<< event data` 可观察字节在管道中的完整转换过程
-- **pre-commit 钩子**：`.git/hooks/pre-commit`，顺序执行与 CI 一致的全量检查
-  （check → clippy → fmt → audit → machete → test），工具未安装时友好跳过
-- **`Account::display_id()`**：新公开方法返回账号标识（email 优先，mobile 兜底）
-- **账号初始化并发限流**：`AccountPool::init()` 通过 `tokio::sync::Semaphore` 限制
-  并发初始化数为 13，避免对 DeepSeek 端和本地连接池造成压力
-- **e2e 测试重构**：从 pytest 迁移为 JSON 场景驱动框架（`runner.py` + `stress_runner.py`），
-  场景文件独立存放，配置从 `config.toml` 动态读取账号数和 api_key
+- **历史对话文件化**：多轮对话历史自动拆分上传为独立文件，绕过 DeepSeek 单次输入长度限制。
+  对适配器层完全透明，上传失败不影响主流程，自动退化为纯文本发送
+- **临时 Session 生命周期**：每次请求创建独立 session，请求结束自动清理（stop_stream + delete_session），
+  彻底杜绝 session 泄漏和 TTL 过期残留
+- **工具调用自修复**：当模型输出的 tool_calls 格式异常时，使用 DeepSeek 自身修复损坏的 JSON/XML，
+  流式和非流式路径均覆盖，大幅提升工具调用成功率
+- **arguments 类型归一**：自动处理 arguments 为 JSON 字符串的异常情况，避免客户端双重转义解析失败
+- **`input_exceeds_limit` 检测**：识别输入超长错误并返回明确错误信息，不再静默失败
+- **全链路日志追踪**：`req-{n}` 标识贯穿 handler → adapter → ds_core 全层，
+  `x-ds-account` 响应头标识处理账号，单次请求可完整 grep 追踪
+- **TRACE 级别字节追踪**：流管道各层 TRACE 日志，可观察字节在 SSE 管道中的完整转换过程
+- **`/` 端点**：免鉴权返回可用端点列表和项目地址
+- **e2e 测试重构**：从 pytest 迁移为 JSON 场景驱动框架，场景独立存放，配置动态读取
 
 ### Changed
-- `Account::session_id()` 返回 `Option<String>` 替代 `Option<&str>`，适配内部锁
-- 账号分配日志从 `info` 降为 `debug` 级别
-- SSE trace 日志精简为单行 `<event> <data>` 格式
-- 空内容警告不再误报工具调用场景（`has_tool_calls=true` 时跳过）
-- `justfile` 精简：移除旧 pytest 靶子，保留正交的 `e2e-basic` / `e2e-repair` / `e2e-stress`
-- 更新中英文 README，增加限流处理与并发策略说明
-- 更新 `docs/deepseek-api-reference.md`：添加 `stop_stream` 端点及 message_id 实际模式
-- **日志级别规范化**：全面审计并修正各级别使用
-  - 账号池耗尽 `INFO` → `WARN`
-  - SSE 流错误 `DEBUG` → `WARN`
-  - tool_parser 修复触发 `DEBUG` → `WARN`
-  - tool_calls 修复成功 `DEBUG` → `INFO`
-  - 新增 ERROR：所有账号初始化失败、PoW 计算失败
-- `health_check` 日志增加 `account=` 字段，区分并发初始化时的多账号输出
-- `stream_tool_calls_repair_with_live_ds` 测试标记为 `#[ignore]`，仅手动调用
-- 同步更新 `docs/logging-spec.md`，补充 `anthropic_compat::*`、`http::*` 等实际 target
-- 默认并行数改为 2，推荐并行数 = 账号数 ÷ 2
-
-### Ref
-- [#19](https://github.com/NIyueeE/ds-free-api/pull/19) — 参考 `x-ds-account` 设计思路
+- **请求流程重构**：从"持久 session + edit_message"升级为"临时 session + completion + 文件上传"，
+  每次请求独立生命周期，不再依赖预创建的持久 session
+- **限流自动重试**：检测到 rate_limit 时以 1s→2s→4s→8s→16s 指数退避自动重试（最多 6 次），
+  对用户透明，大幅降低限流导致的请求失败
+- **Prompt 构建优化**：reminder 插入位置调整到最后一轮对话之前，确保模型优先遵循指令；
+  工具描述的代码块格式化；工具调用结果的 Markdown 结构化展示
+- **推理控制语义修正**：禁用思考时使用 `"none"` 替代 `"minimal"`，语义更明确
+- **日志级别规范化**：账号池耗尽提升为 `WARN`，常规分配降为 `DEBUG`，
+  新增 session/上传/PoW 等 debug 日志，health_check 合并为单条带耗时日志
 
 ### Removed
-- 移除 `examples/adapter_cli/` 中冗余的 allow 注释
-- 移除旧 pytest e2e 测试目录及遗留脚本
+- 账号初始化不再按 model_type 管理 session，移除 session 持久化和 update_title 逻辑
+- 移除旧 pytest e2e 测试目录（被 JSON 场景驱动框架替代）
 
-### Stress Test Results
-- **4 账号 + 3 并发 + 3 迭代**：17 场景（7 basic + 10 repair）× 2 模型 × 3 次迭代 = 102 次请求全部通过，成功率 100%，总耗时 5.9 分钟
+### Test Results
+
+#### py-e2e-tests
+- **4 账号 + 3 并发 + 3 迭代**：17 场景 × 2 模型 × 3 次 = 102 次请求，成功率 100%，总耗时 5.5 分钟
 - 覆盖场景：基础对话、深度思考、流式、标准工具调用，以及 10 种 tool_calls 损坏格式
-  （XML 风格、XML+JSON 混合、字段名不一致、arguments 为字符串、括号不匹配、
-  括号缺失、name/arguments 互换、参数外溢等），修复管道全部正确兜底
-- 验证结论：tool_calls 自修复 + `aggregate()` 修复透传 + `parse_tool_calls` 类型归一
-  三层保障下，模型输出的各类非标准格式均能被正确修复，不产生 500 错误
+  （XML/JSON 混合、字段名不一致、arguments 字符串、括号不匹配/缺失、
+  name/arguments 互换、参数外溢等），修复管道全部正确兜底
+
+#### claude-code 测试
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:5317/anthropic
+export ANTHROPIC_AUTH_TOKEN=sk-test
+export ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek-expert
+export ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-expert
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-default
+claude
+```
+- 基本稳定, 工具解析时会使得claude-code暂时卡住是正常现象, 部分情况可能出现模型不遵循指令导致工具调用指令泄漏
+- 其他编程工具没有大量测试, 希望大家积极反馈
 
 ## [0.2.3] - 2026-04-24
 

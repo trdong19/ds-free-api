@@ -3,6 +3,7 @@
 //! 由于 ds_core 不支持原生 function calling，本模块将工具定义降级为
 //! 自然语言描述，并追加到 prompt 中引导模型输出。
 
+use crate::openai_adapter::response::{TOOL_CALL_END, TOOL_CALL_START};
 use crate::openai_adapter::types::{
     AllowedTools, AllowedToolsChoice, ChatCompletionRequest, CustomTool, CustomToolFormat,
     FunctionDefinition, Tool, ToolChoice,
@@ -10,6 +11,8 @@ use crate::openai_adapter::types::{
 
 /// 提取后的工具上下文
 pub struct ToolContext {
+    /// 格式模板 + 规则 + 示例（位于工具定义之前）
+    pub format_block: Option<String>,
     /// 格式化后的工具定义文本
     pub defs_text: Option<String>,
     /// 根据 tool_choice / parallel_tool_calls 追加的行为指令
@@ -35,6 +38,7 @@ pub fn extract(req: &ChatCompletionRequest) -> Result<ToolContext, String> {
 
     if matches!(tool_choice, ToolChoice::Mode(m) if m == "none") {
         return Ok(ToolContext {
+            format_block: None,
             defs_text: None,
             instruction_text: None,
         });
@@ -45,40 +49,35 @@ pub fn extract(req: &ChatCompletionRequest) -> Result<ToolContext, String> {
     match tool_choice {
         ToolChoice::Mode(mode) => {
             if mode == "required" {
-                instruction_lines.push("注意：你必须调用一个或多个工具。".to_string());
+                instruction_lines.push("**注意：你必须调用一个或多个工具。**".to_string());
             }
         }
         ToolChoice::AllowedTools(AllowedToolsChoice { allowed_tools, .. }) => {
             build_allowed_tools_instruction(allowed_tools, &mut instruction_lines)?;
         }
         ToolChoice::Named(named) => {
-            instruction_lines.push(format!("注意：你必须调用 '{}' 工具。", named.function.name));
+            instruction_lines.push(format!(
+                "**注意：你必须调用 '{}' 工具。**",
+                named.function.name
+            ));
         }
         ToolChoice::Custom(custom) => {
             instruction_lines.push(format!(
-                "注意：你必须调用 '{}' 自定义工具。",
+                "**注意：你必须调用 '{}' 自定义工具。**",
                 custom.custom.name
             ));
         }
     }
 
     if req.parallel_tool_calls == Some(false) {
-        instruction_lines.push("注意：一次只能调用一个工具。".to_string());
+        instruction_lines.push("**注意：一次只能调用一个工具。**".to_string());
     }
 
-    instruction_lines
-        .push("注意：当需要调用工具时，请严格按如下格式输出，不要添加任何解释性文字：".to_string());
-    instruction_lines.push("<tool_calls>".to_string());
-    instruction_lines.push("[{\"name\": \"工具名\", \"arguments\": {参数JSON}}]".to_string());
-    instruction_lines.push("</tool_calls>".to_string());
-    instruction_lines.push("多个工具调用可在同一数组中列出多个对象。".to_string());
-    instruction_lines.push("输出示例：".to_string());
-    instruction_lines.push("<tool_calls>".to_string());
-    instruction_lines.push(
-        "[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"北京\"}}, {\"name\": \"get_weather\", \"arguments\": {\"city\": \"上海\"}}]"
-            .to_string(),
-    );
-    instruction_lines.push("</tool_calls>".to_string());
+    let format_block = if has_tools(req) {
+        Some(build_tool_instruction_block(req))
+    } else {
+        None
+    };
 
     let defs_text = if has_tools(req) {
         let mut lines = vec!["你可以使用以下工具：".to_string()];
@@ -97,6 +96,7 @@ pub fn extract(req: &ChatCompletionRequest) -> Result<ToolContext, String> {
     };
 
     Ok(ToolContext {
+        format_block,
         defs_text,
         instruction_text,
     })
@@ -148,14 +148,14 @@ fn build_allowed_tools_instruction(
             .collect();
         if !names.is_empty() {
             lines.push(format!(
-                "注意：你只能从以下允许的工具中选择：{}。",
+                "**注意：**你只能从以下允许的工具中选择：{}。",
                 names.join(", ")
             ));
         }
     }
 
     if allowed_tools.mode == "required" {
-        lines.push("注意：你必须调用一个或多个工具。".to_string());
+        lines.push("**注意：你必须调用一个或多个工具。**".to_string());
     }
     Ok(())
 }
@@ -184,31 +184,158 @@ fn format_function(func: &FunctionDefinition) -> Result<String, String> {
         return Err("tools 中 function 缺少必填字段 'name'".into());
     }
     let params = serde_json::to_string(&func.parameters).unwrap_or_else(|_| "{}".into());
+    let call_example = format!(
+        "{TOOL_CALL_START}[{{\"name\": \"{}\", \"arguments\": {}}}]{TOOL_CALL_END}",
+        func.name, params
+    );
+    let desc = func.description.as_deref().unwrap_or("").trim();
+    let desc_block = if desc.is_empty() {
+        "  无描述".to_string()
+    } else {
+        format!("~~~\n  {}\n~~~\n", desc)
+    };
     Ok(format!(
-        "- {} (function): {}\n  参数(JSON schema): {}",
-        func.name,
-        func.description.as_deref().unwrap_or(""),
-        params
+        "- **{}** (function):\n  - 调用方法: `{}`\n  - 简要说明:\n{}",
+        func.name, call_example, desc_block,
     ))
 }
 
+/// 构建工具调用指令块：模板 → 规则 → 动态正确示例
+fn build_tool_instruction_block(req: &ChatCompletionRequest) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    // 模板
+    lines.push("**工具调用格式 — 请严格遵守：**".into());
+    lines.push(String::new());
+    lines.push("将 JSON 数组包裹在工具调用标记中：".into());
+    lines.push(String::new());
+    lines.push(TOOL_CALL_START.into());
+    lines.push("[{\"name\": \"工具名\", \"arguments\": {参数JSON}}]".into());
+    lines.push(TOOL_CALL_END.into());
+    lines.push(String::new());
+
+    // 规则
+    lines.push("**规则：**".into());
+    lines.push(String::new());
+    lines.push(format!("1. JSON 数组必须以 `{TOOL_CALL_START}` 开头、以 `{TOOL_CALL_END}` 结尾，将数组**完整包裹**在标记内。"));
+    lines.push("2. 所有工具调用必须放在**一个** JSON 数组中，多个调用用逗号分隔。".into());
+    lines.push(format!(
+        "3. 输出 `{TOOL_CALL_END}` 后**立即停止**，不得添加后续文本、XML 标签或说明文字。"
+    ));
+    lines.push("4. 不要将工具调用包裹在 markdown 代码块中。".into());
+    lines.push("5. 只输出格式块本身，不要输出解释性文字。".into());
+    lines.push("6. 字符串参数值必须用**双引号**包裹（JSON 标准）。".into());
+    lines.push(format!(
+        "7. 决定调用工具时，输出的**第一个非空白字符**必须是 `{TOOL_CALL_START}`。"
+    ));
+    lines.push(String::new());
+
+    let tool_names: Vec<String> = req
+        .tools
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|t| t.function.as_ref().map(|f| f.name.clone()))
+        .collect();
+    let a = tool_names.first().map(|s| s.as_str()).unwrap_or("tool_a");
+
+    // 正确示例（使用实际工具名，带真实参数）
+    lines.push("**正确示例：**".into());
+    lines.push(String::new());
+
+    // 示例A：单个工具
+    lines.push("**示例A** — 调用一个工具：".into());
+    lines.push(TOOL_CALL_START.into());
+    lines.push(format!(
+        "[{{\"name\": \"{a}\", \"arguments\": {}}}]",
+        example_args(a)
+    ));
+    lines.push(TOOL_CALL_END.into());
+    lines.push(String::new());
+
+    // 示例B：两个工具并行
+    if tool_names.len() >= 2 {
+        let items: Vec<String> = tool_names[..2]
+            .iter()
+            .map(|n| format!("{{\"name\": \"{n}\", \"arguments\": {}}}", example_args(n)))
+            .collect();
+        lines.push("**示例B** — 同时调用多个工具（一个数组包含全部调用）：".into());
+        lines.push(String::new());
+        lines.push(TOOL_CALL_START.into());
+        lines.push(format!("[{}]", items.join(", ")));
+        lines.push(TOOL_CALL_END.into());
+        lines.push(String::new());
+    }
+
+    // 示例C：三个工具并行
+    if tool_names.len() >= 3 {
+        let items: Vec<String> = tool_names[..3]
+            .iter()
+            .map(|n| format!("{{\"name\": \"{n}\", \"arguments\": {}}}", example_args(n)))
+            .collect();
+        lines.push("**示例C** — 同时调用三个工具（所有调用在一个数组中）：".into());
+        lines.push(String::new());
+        lines.push(TOOL_CALL_START.into());
+        lines.push(format!("[{}]", items.join(", ")));
+        lines.push(TOOL_CALL_END.into());
+        lines.push(String::new());
+    }
+
+    // 示例D：嵌套参数（参数值为数组或对象时仍是标准 JSON）
+    if !tool_names.is_empty() {
+        let d_name = tool_names.first().map(|s| s.as_str()).unwrap_or("tool_a");
+        lines.push("**示例D** — 参数值为嵌套对象/数组（仍然是标准 JSON）：".into());
+        lines.push(String::new());
+        lines.push(TOOL_CALL_START.into());
+        lines.push(format!(
+            "[{{\"name\": \"{d_name}\", \"arguments\": {}}}]",
+            example_nested_args(d_name)
+        ));
+        lines.push(TOOL_CALL_END.into());
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
+}
+
+/// 根据工具名返回示例参数字符串
+fn example_args(name: &str) -> String {
+    let args: &str = match name {
+        "Read" | "read_file" => r#""file_path": "/path/to/file""#,
+        "Bash" | "execute_command" | "exec_command" => r#""command": "ls -la""#,
+        "Write" | "write_to_file" => r#""file_path": "/path/to/file", "content": "hello""#,
+        "Edit" => r#""file_path": "/path/to/file", "old_string": "foo", "new_string": "bar""#,
+        "Glob" => r#""pattern": "**/*.rs", "path": "."#,
+        "search_files" => r#""query": "TODO", "path": "."#,
+        "get_weather" => r#""city": "Beijing""#,
+        "get_time" => r#""timezone": "Asia/Shanghai""#,
+        "list_files" => r#""path": "."#,
+        _ => r#""key": "value""#,
+    };
+    format!("{{{args}}}")
+}
+
+/// 返回嵌套参数示例（参数值为数组或对象）
+fn example_nested_args(name: &str) -> String {
+    match name {
+        "Edit" => r#"{"file_path": "/path/to/file", "edits": [{"old_string": "foo", "new_string": "bar"}, {"old_string": "x", "new_string": "y"}]}"#.into(),
+        _ => r#"{"config": {"enabled": true, "items": ["a", "b"]}}"#.into(),
+    }
+}
+
 fn format_custom(custom: &CustomTool) -> String {
-    let format_desc: &str = match &custom.format {
-        Some(CustomToolFormat::Text) => "text",
+    let desc = custom.description.as_deref().unwrap_or("").trim();
+    let method = match &custom.format {
+        Some(CustomToolFormat::Text) => "text".into(),
         Some(CustomToolFormat::Grammar { grammar }) => {
-            return format!(
-                "- {} (custom): {}\n  格式: grammar(syntax: {})",
-                custom.name,
-                custom.description.as_deref().unwrap_or(""),
-                grammar.syntax
-            );
+            format!("grammar(syntax: {})", grammar.syntax)
         }
-        None => "无约束",
+        None => "无约束".into(),
     };
     format!(
-        "- {} (custom): {}\n  格式: {}",
+        "- **{}** (custom):\n  - 调用方法: `{}`\n  - 简要说明: {}",
         custom.name,
-        custom.description.as_deref().unwrap_or(""),
-        format_desc
+        method,
+        if desc.is_empty() { "无描述" } else { desc },
     )
 }

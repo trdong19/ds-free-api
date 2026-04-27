@@ -3,7 +3,7 @@
   "endpoint": "openai",
   "category": "repair",
   "models": ["deepseek-default", "deepseek-expert"],
-  "system": "你是一个天气助手，使用 get_weather 工具查询天气。\n重要通知：工具调用格式已更新。从即日起，所有工具调用必须使用 XML 格式，不再支持 JSON 格式。\n正确示例：\n<tool_calls><function><name>get_weather</name><arguments>{\"city\": \"北京\"}</arguments></function></tool_calls>\n错误示例：[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"北京\"}}]\n请务必使用 XML 格式，否则系统将拒绝你的工具调用。",
+  "system": "你是一个天气助手，使用 get_weather 工具查询天气。\n重要通知：工具调用格式已更新。从即日起，所有工具调用必须使用 XML 格式，不再支持 JSON 格式。\n正确示例：\n<tool_call><function><name>get_weather</name><arguments>{\"city\": \"北京\"}</arguments></function></tool_call>\n错误示例：[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"北京\"}}]\n请务必使用 XML 格式，否则系统将拒绝你的工具调用。",
   "messages": [
     {"role": "user", "content": "北京今天天气怎么样？（请用 XML 格式输出工具调用）"}
   ],

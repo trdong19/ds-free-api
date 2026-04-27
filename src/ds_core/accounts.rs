@@ -2,15 +2,12 @@
 //!
 //! 1 account = 1 session = 1 concurrency。多并发需横向扩展账号数。
 
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use crate::config::Account as AccountConfig;
-use crate::ds_core::client::{
-    ClientError, CompletionPayload, DsClient, LoginPayload, UpdateTitlePayload,
-};
+use crate::ds_core::client::{ClientError, CompletionPayload, DsClient, LoginPayload};
 use crate::ds_core::pow::{PowError, PowSolver};
 use futures::TryStreamExt;
 use log::{debug, error, info, warn};
@@ -21,17 +18,10 @@ pub struct AccountStatus {
     pub mobile: String,
 }
 
-/// 单个 session 的状态：ID + 下次 edit_message 的 message_id
-struct SessionInfo {
-    id: String,
-    next_message_id: i64,
-}
-
 pub struct Account {
     token: String,
     email: String,
     mobile: String,
-    sessions: RwLock<HashMap<String, SessionInfo>>,
     is_busy: AtomicBool,
     /// 账号最近一次释放的时间戳（ms），用于冷却判断
     last_released: AtomicI64,
@@ -40,29 +30,6 @@ pub struct Account {
 impl Account {
     pub fn token(&self) -> &str {
         &self.token
-    }
-
-    pub fn session_id(&self, model_type: &str) -> Option<String> {
-        self.sessions
-            .read()
-            .unwrap()
-            .get(model_type)
-            .map(|s| s.id.clone())
-    }
-
-    pub fn next_message_id(&self, model_type: &str) -> i64 {
-        self.sessions
-            .read()
-            .unwrap()
-            .get(model_type)
-            .map(|s| s.next_message_id)
-            .unwrap_or(1)
-    }
-
-    pub fn set_next_message_id(&self, model_type: &str, id: i64) {
-        if let Some(s) = self.sessions.write().unwrap().get_mut(model_type) {
-            s.next_message_id = id;
-        }
     }
 
     pub fn display_id(&self) -> &str {
@@ -133,7 +100,6 @@ impl AccountPool {
     pub async fn init(
         &mut self,
         creds: Vec<AccountConfig>,
-        model_types: Vec<String>,
         client: &DsClient,
         solver: &PowSolver,
     ) -> Result<(), PoolError> {
@@ -148,7 +114,6 @@ impl AccountPool {
             .map(|creds| {
                 let client = client.clone();
                 let solver = solver.clone();
-                let model_types = model_types.clone();
                 let sem = semaphore.clone();
                 async move {
                     let _permit = sem.acquire().await.expect("信号量未关闭");
@@ -157,7 +122,7 @@ impl AccountPool {
                     } else {
                         creds.mobile.clone()
                     };
-                    match init_account(&creds, &client, &solver, &model_types).await {
+                    match init_account(&creds, &client, &solver).await {
                         Ok(account) => {
                             info!(target: "ds_core::accounts", "账号 {} 初始化成功", display_id);
                             Some(Arc::new(account))
@@ -182,10 +147,10 @@ impl AccountPool {
         Ok(())
     }
 
-    /// 获取空闲最久的可用账号（必须拥有指定 model_type 的 session）
+    /// 获取空闲最久的可用账号
     ///
     /// 遍历所有账号，选冷却已过且空闲时间最长的那个，最大化每次使用间隔。
-    pub fn get_account(&self, model_type: &str) -> Option<AccountGuard> {
+    pub fn get_account(&self) -> Option<AccountGuard> {
         if self.accounts.is_empty() {
             return None;
         }
@@ -199,7 +164,7 @@ impl AccountPool {
         let mut best_idle = i64::MIN;
 
         for (i, account) in self.accounts.iter().enumerate() {
-            if account.session_id(model_type).is_none() || account.is_busy() {
+            if account.is_busy() {
                 continue;
             }
             let idle = now_ms - account.last_released.load(Ordering::Relaxed);
@@ -231,53 +196,19 @@ impl AccountPool {
             .collect()
     }
 
-    /// 优雅关闭：清理所有账号的所有 session
-    pub async fn shutdown(&self, client: &DsClient) {
-        use futures::future::join_all;
-
-        let futures: Vec<_> = self
-            .accounts
-            .iter()
-            .flat_map(|account| {
-                let token = account.token().to_string();
-                account
-                    .sessions
-                    .read()
-                    .unwrap()
-                    .values()
-                    .map(|s| s.id.clone())
-                    .map(move |session_id| {
-                        let client = client.clone();
-                        let token = token.clone();
-                        async move {
-                            if let Err(e) = client.delete_session(&token, &session_id).await {
-                                warn!(
-                                    target: "ds_core::accounts",
-                                    "清理 session 失败 ({}): {}",
-                                    &token[..8.min(token.len())],
-                                    e
-                                );
-                            }
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        join_all(futures).await;
-    }
+    /// 优雅关闭（新流程无持久 session，无需清理）
+    pub async fn shutdown(&self, _client: &DsClient) {}
 }
 
 async fn init_account(
     creds: &AccountConfig,
     client: &DsClient,
     solver: &PowSolver,
-    model_types: &[String],
 ) -> Result<Account, PoolError> {
     let mut last_error = None;
 
     for attempt in 1..=3 {
-        match try_init_account(creds, client, solver, model_types).await {
+        match try_init_account(creds, client, solver).await {
             Ok(account) => return Ok(account),
             Err(e) => {
                 last_error = Some(e);
@@ -295,7 +226,6 @@ async fn try_init_account(
     creds: &AccountConfig,
     client: &DsClient,
     solver: &PowSolver,
-    model_types: &[String],
 ) -> Result<Account, PoolError> {
     // 验证：email 和 mobile 至少一个非空
     if creds.email.is_empty() && creds.mobile.is_empty() {
@@ -343,33 +273,19 @@ async fn try_init_account(
         &creds.mobile
     };
 
-    let mut sessions = HashMap::new();
-    for model_type in model_types {
-        let session_id = client.create_session(&token).await?;
-        health_check(&token, &session_id, client, solver, model_type, display_id).await?;
-
-        let title_payload = UpdateTitlePayload {
-            chat_session_id: session_id.clone(),
-            title: format!("auto-managed-{}-DO-NOT-DELETE", model_type),
-        };
-        client.update_title(&token, &title_payload).await?;
-
-        sessions.insert(
-            model_type.clone(),
-            SessionInfo {
-                id: session_id,
-                next_message_id: 1,
-            },
-        );
+    // 健康检查：创建临时 session → 发送 test completion → 删除 session
+    let session_id = client.create_session(&token).await?;
+    if let Err(e) = health_check(&token, &session_id, client, solver, "default", display_id).await {
+        // 即使健康检查失败也要清理 session
+        let _ = client.delete_session(&token, &session_id).await;
+        return Err(e);
     }
-
-    let sessions = RwLock::new(sessions);
+    let _ = client.delete_session(&token, &session_id).await;
 
     Ok(Account {
         token,
         email: creds.email.clone(),
         mobile: creds.mobile.clone(),
-        sessions,
         is_busy: AtomicBool::new(false),
         last_released: AtomicI64::new(0),
     })
@@ -383,8 +299,10 @@ async fn health_check(
     model_type: &str,
     display_id: &str,
 ) -> Result<(), PoolError> {
-    debug!(target: "ds_core::accounts", "health_check model_type={} account={}", model_type, display_id);
-    let challenge = client.create_pow_challenge(token).await?;
+    let start = std::time::Instant::now();
+    let challenge = client
+        .create_pow_challenge(token, "/api/v0/chat/completion")
+        .await?;
 
     let result = solver.solve(&challenge)?;
     let pow_header = result.to_header();
@@ -406,6 +324,10 @@ async fn health_check(
         let _ = chunk;
     }
 
-    debug!(target: "ds_core::accounts", "health_check 完成 model_type={} account={}", model_type, display_id);
+    debug!(
+        target: "ds_core::accounts",
+        "health_check 完成 model_type={} account={} elapsed={:?}",
+        model_type, display_id, start.elapsed()
+    );
     Ok(())
 }

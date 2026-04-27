@@ -320,14 +320,12 @@ cargo test
 # Run only library tests (skips example compilation, faster iteration)
 cargo test --lib
 
-# Run Python e2e tests (requires `uv` and server running on port 5317)
-just e2e
+# e2e tests (requires `uv`, server on port 5317)
+just e2e-basic    # 基础功能（OpenAI + Anthropic 双端点）
+just e2e-repair   # 工具调用损坏修复专项
+just e2e-stress   # 全部场景 × 3 次迭代压测
 
-# Stress tests (in py-e2e-tests/, against a running server)
-uv run python py-e2e-tests/stress_test_tools_openai.py
-uv run python py-e2e-tests/stress_test_tools_anthropic.py
-
-# Start server with e2e test config
+# Start server with e2e config
 just e2e-serve
 
 # Individual checks

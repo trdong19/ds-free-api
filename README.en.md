@@ -27,7 +27,7 @@ Reverse proxy that adapts and converts free DeepSeek web chat into standard Open
 - **Dual protocol**: OpenAI Chat Completions + Anthropic Messages API, works with existing tools and SDKs
 - **Tool call ready**: Full function calling support with XML parsing and three-tier self-repair pipeline (text fixes → JSON repair → live model fallback), covering 10+ malformed formats
 - **Rust implementation**: Single binary + single TOML config, cross-platform native performance
-- **Multi-account pool**: Most-idle-first rotation, automatic session management, horizontal concurrency scaling
+- **Multi-account pool**: Most-idle-first rotation, horizontal concurrency scaling
 
 ## Quick Start
 
@@ -65,11 +65,8 @@ Required fields only. One account = one concurrency slot.
 > - **Auto rate-limit detection**: Monitors SSE `hint` events for `rate_limit` signals
 > - **Exponential backoff retry**: Automatically retries with 1s→2s→4s→8s→16s intervals (up to 6 attempts)
 > - **Smart `stop_stream`**: Only fires on client disconnect, skipped on normal completion — prevents request conflicts
-> - **Dynamic message_id tracking**: Parses real session IDs from SSE `ready` events, supporting multiple edits within the same session
 >
-> Verified: 4 accounts + 2 concurrent workers pass all stress scenarios at 100%. 4 accounts + 4 concurrent workers also pass all e2e tests consistently. A single account can also pass all tests thanks to the retry mechanism.
->
-> While the system guarantees minimum parallelism = number of accounts (no lock contention), **parallelism = accounts / 2 is recommended** to avoid excessive internal retry latency.
+> **Recommended parallelism = accounts / 2**. Verified: 4 accounts + 2 concurrent workers pass all stress scenarios at 100%. A single account can also pass all tests thanks to the retry mechanism.
 
 ```toml
 [server]
@@ -200,6 +197,7 @@ flowchart TB
         Pool["Account pool rotation"]:::core
         Pow["PoW solving"]:::core
         Chat["Chat orchestration"]:::core
+        Upload["History file upload"]:::core
     end
 
     DeepSeek[("DeepSeek API")]:::external
@@ -212,7 +210,8 @@ flowchart TB
     ReqParse --> Pool
     Pool --> Pow
     Pow --> Chat
-    Chat -->|"DeepSeek internal protocol"| DeepSeek
+    Chat -->|"split multi-turn history"| Upload
+    Upload -->|"completion + file ref"| DeepSeek
 
     %% ========== Response flow ==========
     Chat -.->|"SSE stream"| RespTrans

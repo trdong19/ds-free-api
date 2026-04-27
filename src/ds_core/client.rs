@@ -17,14 +17,14 @@ use thiserror::Error;
 const ENDPOINT_USERS_LOGIN: &str = "/users/login";
 const ENDPOINT_CHAT_SESSION_CREATE: &str = "/chat_session/create";
 const ENDPOINT_CHAT_SESSION_DELETE: &str = "/chat_session/delete";
+#[allow(dead_code)]
 const ENDPOINT_CHAT_SESSION_UPDATE_TITLE: &str = "/chat_session/update_title";
 const ENDPOINT_CHAT_CREATE_POW_CHALLENGE: &str = "/chat/create_pow_challenge";
 const ENDPOINT_CHAT_COMPLETION: &str = "/chat/completion";
+#[allow(dead_code)]
 const ENDPOINT_CHAT_EDIT_MESSAGE: &str = "/chat/edit_message";
 const ENDPOINT_CHAT_STOP_STREAM: &str = "/chat/stop_stream";
-#[allow(dead_code)]
 const ENDPOINT_FILE_UPLOAD: &str = "/file/upload_file";
-#[allow(dead_code)]
 const ENDPOINT_FILE_FETCH: &str = "/file/fetch_files";
 
 #[derive(Debug, Error)]
@@ -136,6 +136,31 @@ struct CreateSessionWrapper {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+pub struct UploadFileData {
+    pub id: String,
+    pub status: String,
+    pub file_name: String,
+    pub file_size: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FetchFilesData {
+    pub files: Vec<FileInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct FileInfo {
+    pub id: String,
+    pub status: String,
+    pub file_name: String,
+    pub file_size: i64,
+    #[serde(default)]
+    pub token_usage: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ChallengeData {
     pub algorithm: String,
     pub challenge: String,
@@ -167,6 +192,7 @@ pub struct CompletionPayload {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct EditMessagePayload {
     pub chat_session_id: String,
     pub message_id: i64,
@@ -177,6 +203,7 @@ pub struct EditMessagePayload {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct UpdateTitlePayload {
     pub chat_session_id: String,
     pub title: String,
@@ -312,7 +339,11 @@ impl DsClient {
         Ok(())
     }
 
-    pub async fn create_pow_challenge(&self, token: &str) -> Result<ChallengeData, ClientError> {
+    pub async fn create_pow_challenge(
+        &self,
+        token: &str,
+        target_path: &str,
+    ) -> Result<ChallengeData, ClientError> {
         let resp = self
             .http
             .post(format!(
@@ -320,7 +351,7 @@ impl DsClient {
                 self.api_base, ENDPOINT_CHAT_CREATE_POW_CHALLENGE
             ))
             .headers(self.auth_headers(token)?)
-            .json(&serde_json::json!({ "target_path": "/api/v0/chat/completion" }))
+            .json(&serde_json::json!({ "target_path": target_path }))
             .send()
             .await?;
         let wrapper: ChallengeWrapper = Self::parse_envelope(resp).await?;
@@ -354,6 +385,7 @@ impl DsClient {
         Ok(Box::pin(resp.bytes_stream().map_err(ClientError::Http)))
     }
 
+    #[allow(dead_code)]
     pub async fn edit_message(
         &self,
         token: &str,
@@ -380,6 +412,7 @@ impl DsClient {
         Ok(Box::pin(resp.bytes_stream().map_err(ClientError::Http)))
     }
 
+    #[allow(dead_code)]
     pub async fn update_title(
         &self,
         token: &str,
@@ -416,10 +449,7 @@ impl DsClient {
         Ok(())
     }
 
-    /// 上传文件（裸 HTTP 调用，保留供未来使用）
-    ///
-    /// 注意：后端 API 目前不支持真正的文件上传功能
-    #[allow(dead_code)]
+    /// 上传文件，返回文件元数据（id, status 等）
     pub async fn upload_file(
         &self,
         token: &str,
@@ -427,7 +457,7 @@ impl DsClient {
         filename: &str,
         content_type: &str,
         bytes: Vec<u8>,
-    ) -> Result<(), ClientError> {
+    ) -> Result<UploadFileData, ClientError> {
         let part = Part::bytes(bytes)
             .file_name(filename.to_string())
             .mime_str(content_type)?;
@@ -440,15 +470,15 @@ impl DsClient {
             .multipart(form)
             .send()
             .await?;
-        let _ = resp.bytes().await?;
-        Ok(())
+        Self::parse_envelope::<UploadFileData>(resp).await
     }
 
-    /// 获取文件状态（裸 HTTP 调用，保留供未来使用）
-    ///
-    /// 注意：后端 API 目前不支持真正的文件上传功能
-    #[allow(dead_code)]
-    pub async fn fetch_files(&self, token: &str, file_ids: &[String]) -> Result<(), ClientError> {
+    /// 查询文件状态，返回文件列表（含 status: PENDING/SUCCESS/FAILED）
+    pub async fn fetch_files(
+        &self,
+        token: &str,
+        file_ids: &[String],
+    ) -> Result<FetchFilesData, ClientError> {
         let ids = file_ids.join(",");
         let resp = self
             .http
@@ -457,8 +487,7 @@ impl DsClient {
             .query(&[("file_ids", &ids)])
             .send()
             .await?;
-        let _ = resp.bytes().await?;
-        Ok(())
+        Self::parse_envelope::<FetchFilesData>(resp).await
     }
 
     pub async fn get_wasm(&self) -> Result<Bytes, ClientError> {

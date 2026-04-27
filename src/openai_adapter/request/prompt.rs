@@ -4,28 +4,41 @@
 //! 插入到 `<|im_start|>assistant` 之前，确保工具上下文始终紧邻模型生成位置。
 
 use super::tools::ToolContext;
+use crate::openai_adapter::response::{TOOL_CALL_END, TOOL_CALL_START};
 use crate::openai_adapter::types::{ChatCompletionRequest, ContentPart, Message, MessageContent};
 
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
 
 /// 构建 ChatML 格式的 prompt 字符串
+/// 顺序: [system] [历史 user/tool/assistant 轮次...] [reminder] [最后一轮 user/tool] <|im_start|>assistant
 pub fn build(req: &ChatCompletionRequest, tool_ctx: &ToolContext) -> String {
-    let mut parts: Vec<String> = req.messages.iter().map(format_message).collect();
+    let msg_parts: Vec<String> = req.messages.iter().map(format_message).collect();
 
-    let mut extra_blocks: Vec<String> = Vec::new();
+    let mut tool_sections: Vec<String> = Vec::new();
+
+    if let Some(text) = tool_ctx.format_block.as_deref() {
+        tool_sections.push(format!("### 格式规范\n{}", text));
+    }
     if let Some(text) = tool_ctx.defs_text.as_deref() {
-        extra_blocks.push(text.to_string());
+        tool_sections.push(format!("### 工具定义\n{}", text));
     }
     if let Some(text) = tool_ctx.instruction_text.as_deref() {
-        extra_blocks.push(text.to_string());
+        tool_sections.push(format!("### 调用指令\n{}", text));
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+
+    if !tool_sections.is_empty() {
+        sections.push(format!("## 工具调用\n{}", tool_sections.join("\n\n")));
     }
 
     // response_format 降级：将格式约束注入到 reminder 块中
     if let Some(rf) = &req.response_format {
-        match rf.ty.as_str() {
+        let text = match rf.ty.as_str() {
             "json_object" => {
-                extra_blocks.push("请直接输出合法的 JSON 对象，不要包含任何 markdown 代码块标记或其他解释性文字。".to_string());
+                "请直接输出合法的 JSON 对象，不要包含任何 markdown 代码块标记或其他解释性文字。"
+                    .into()
             }
             "json_schema" => {
                 let schema_text = rf
@@ -34,28 +47,49 @@ pub fn build(req: &ChatCompletionRequest, tool_ctx: &ToolContext) -> String {
                     .map(|s| serde_json::to_string(s).unwrap_or_default())
                     .unwrap_or_default();
                 if schema_text.is_empty() {
-                    extra_blocks.push(
-                        "请严格遵循 JSON Schema 输出，不要添加 markdown 代码块。".to_string(),
-                    );
+                    "以 JSON 的形式输出。".into()
                 } else {
-                    extra_blocks.push(format!(
-                        "请严格遵循以下 JSON Schema 输出，不要包含 schema 之外的内容，不要添加 markdown 代码块。\nSchema: {}",
+                    format!(
+                        "以 JSON 的形式输出，输出的 JSON 需遵守以下的格式：\n\n~~~json\n{}\n~~~",
                         schema_text
-                    ));
+                    )
                 }
             }
-            "text" => {} // 默认值，无需注入
-            _ => {
-                extra_blocks.push(format!("请以 {} 格式输出。", rf.ty));
-            }
+            "text" => String::new(),
+            _ => format!("请以 {} 格式输出。", rf.ty),
+        };
+        if !text.is_empty() {
+            sections.push(format!("## 输出格式\n{}", text));
         }
     }
 
-    if !extra_blocks.is_empty() {
-        let extra = extra_blocks.join("\n\n");
-        parts.push(format!("{IM_START}reminder\n{extra}\n{IM_END}"));
-    }
+    // 找到最后一个 user/tool 消息的位置，reminder 插入在它前面
+    let insert_pos = req
+        .messages
+        .iter()
+        .rposition(|m| m.role == "user" || m.role == "tool")
+        .unwrap_or(msg_parts.len());
 
+    let mut parts = Vec::with_capacity(msg_parts.len() + 2);
+    parts.extend(msg_parts[..insert_pos].iter().cloned());
+    if !sections.is_empty() {
+        let extra = sections.join("\n\n");
+        parts.push(format!(
+            "{IM_START}reminder\n# 重要提醒\n\n{extra}\n{IM_END}"
+        ));
+    }
+    parts.extend(msg_parts[insert_pos..].iter().cloned());
+    if tool_ctx.defs_text.is_some() {
+        let instruction = format!("(工具调用请使用 {TOOL_CALL_START} 和 {TOOL_CALL_END} 包裹。)");
+        for part in parts.iter_mut().rev() {
+            if part.starts_with(&format!("{IM_START}user"))
+                || part.starts_with(&format!("{IM_START}tool"))
+            {
+                *part = part.replacen(IM_END, &format!("{instruction}\n{IM_END}"), 1);
+                break;
+            }
+        }
+    }
     parts.push(format!("{IM_START}assistant"));
     parts.join("\n")
 }
@@ -67,7 +101,7 @@ fn format_message(msg: &Message) -> String {
         "function" => format_function(msg),
         _ => format_generic(msg),
     };
-    format!("{IM_START}{}\n{}\n{IM_END}", msg.role, body)
+    format!("{IM_START}{}\n{}\n{IM_END}\n\n\n", msg.role, body)
 }
 
 fn format_generic(msg: &Message) -> String {
@@ -102,7 +136,7 @@ fn format_assistant(msg: &Message) -> String {
             })
             .collect();
         parts.push(format!(
-            "<tool_calls>\n[{}]\n</tool_calls>",
+            "{TOOL_CALL_START}\n[{}]\n{TOOL_CALL_END}",
             items.join(", ")
         ));
     }
@@ -114,7 +148,7 @@ fn format_assistant(msg: &Message) -> String {
             serde_json::to_string(&fc.name).unwrap_or_else(|_| "\"\"".into()),
             serde_json::to_string(&args).unwrap_or_else(|_| "null".into()),
         );
-        parts.push(format!("<tool_calls>\n[{item}]\n</tool_calls>"));
+        parts.push(format!("{TOOL_CALL_START}\n[{item}]\n{TOOL_CALL_END}"));
     }
     if let Some(refusal) = &msg.refusal {
         parts.push(format!("(refusal: {refusal})"));
@@ -124,11 +158,18 @@ fn format_assistant(msg: &Message) -> String {
 
 fn format_tool(msg: &Message) -> String {
     let mut parts = Vec::new();
-    if let Some(id) = &msg.tool_call_id {
-        parts.push(format!("(tool_call_id: {id})"));
+    parts.push("# 工具调用结果".to_string());
+    if let Some(name) = &msg.name {
+        parts.push(format!("## 工具名称: {}", name));
     }
+    if let Some(id) = &msg.tool_call_id {
+        parts.push(format!("## 调用id: {}", id));
+    }
+    parts.push("## 调用结果:".to_string());
     if let Some(content) = &msg.content {
+        parts.push("~~~".to_string());
         parts.push(format_content(content));
+        parts.push("~~~".to_string());
     }
     parts.join("\n")
 }

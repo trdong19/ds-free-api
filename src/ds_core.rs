@@ -8,7 +8,7 @@ mod completions;
 mod pow;
 
 pub use accounts::AccountStatus;
-pub use completions::{ChatRequest, ChatResponse};
+pub use completions::{ChatRequest, ChatResponse, FilePayload};
 
 use crate::config::Config;
 use accounts::AccountPool;
@@ -59,23 +59,18 @@ impl DeepSeekCore {
         let solver = PowSolver::new(&wasm_bytes)?;
 
         let mut pool = AccountPool::new();
-        pool.init(
-            config.accounts.clone(),
-            config.deepseek.model_types.clone(),
-            &client,
-            &solver,
-        )
-        .await
-        .map_err(|e| match e {
-            accounts::PoolError::AllAccountsFailed => {
-                CoreError::ProviderError("所有账号初始化失败".to_string())
-            }
-            accounts::PoolError::Client(e) => CoreError::ProviderError(e.to_string()),
-            accounts::PoolError::Pow(e) => CoreError::ProofOfWorkFailed(e),
-            accounts::PoolError::Validation(msg) => {
-                CoreError::ProviderError(format!("配置错误: {}", msg))
-            }
-        })?;
+        pool.init(config.accounts.clone(), &client, &solver)
+            .await
+            .map_err(|e| match e {
+                accounts::PoolError::AllAccountsFailed => {
+                    CoreError::ProviderError("所有账号初始化失败".to_string())
+                }
+                accounts::PoolError::Client(e) => CoreError::ProviderError(e.to_string()),
+                accounts::PoolError::Pow(e) => CoreError::ProofOfWorkFailed(e),
+                accounts::PoolError::Validation(msg) => {
+                    CoreError::ProviderError(format!("配置错误: {}", msg))
+                }
+            })?;
 
         let completions = crate::ds_core::completions::Completions::new(client, solver, pool);
 

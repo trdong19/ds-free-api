@@ -94,6 +94,7 @@ pub fn parse(
             thinking_enabled: model_res.thinking_enabled,
             search_enabled: model_res.search_enabled,
             model_type: model_res.model_type,
+            files: vec![],
         },
         stream: norm.stream,
         include_usage: norm.include_usage,
@@ -291,8 +292,8 @@ mod tests {
             ("medium", true),
             ("high", true),
             ("xhigh", true),
-            ("unknown", false),
-            ("", false),
+            ("unknown", true),
+            ("", true),
         ] {
             let body = serde_json::json!({
                 "model": "deepseek-default",
@@ -479,7 +480,7 @@ mod tests {
         assert!(
             req.ds_req
                 .prompt
-                .contains("注意：你只能从以下允许的工具中选择：get_weather")
+                .contains("你只能从以下允许的工具中选择：get_weather")
         );
         assert!(req.ds_req.prompt.contains("注意：你必须调用一个或多个工具"));
     }
@@ -498,11 +499,11 @@ mod tests {
             "tool_choice": { "type": "custom", "custom": { "name": "my_custom" } }
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("- my_custom (custom):"));
+        assert!(req.ds_req.prompt.contains("**my_custom** (custom):"));
         assert!(
             req.ds_req
                 .prompt
-                .contains("注意：你必须调用 'my_custom' 自定义工具")
+                .contains("你必须调用 'my_custom' 自定义工具")
         );
     }
 
@@ -545,7 +546,8 @@ mod tests {
             ]
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("格式: 无约束"));
+        assert!(req.ds_req.prompt.contains("调用方法:"));
+        assert!(req.ds_req.prompt.contains("无约束"));
     }
 
     #[test]
@@ -613,7 +615,7 @@ mod tests {
             "工具定义不应追加到 user 消息中"
         );
         assert!(
-            prompt.contains("<|im_start|>reminder\n你可以使用以下工具"),
+            prompt.contains("<|im_start|>reminder\n# 重要提醒"),
             "工具定义应在独立的 reminder 块中"
         );
         // reminder 块应在最后的 assistant 前缀前面
@@ -655,7 +657,7 @@ mod tests {
         let prompt = &req.ds_req.prompt;
         // 即使最后一条是 tool role，reminder 块也应紧跟在 assistant 前面
         assert!(
-            prompt.contains("<|im_start|>reminder\n你可以使用以下工具"),
+            prompt.contains("<|im_start|>reminder\n# 重要提醒"),
             "工具定义应在独立的 reminder 块中"
         );
         let reminder_pos = prompt.find("<|im_start|>reminder").unwrap();
@@ -758,7 +760,7 @@ mod tests {
             }
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("JSON Schema"));
+        assert!(req.ds_req.prompt.contains("遵守以下的格式"));
         assert!(req.ds_req.prompt.contains("person"));
     }
 

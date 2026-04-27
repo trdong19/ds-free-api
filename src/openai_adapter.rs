@@ -180,29 +180,37 @@ impl OpenAIAdapter {
 
     /// 创建 tool_calls 修复闭包，捕获 Arc<DeepSeekCore> 发起修复请求
     pub(crate) fn create_repair_fn(&self, request_id: &str) -> response::RepairFn {
-        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU16, Ordering};
         let core = self.ds_core.clone();
         let req_id = request_id.to_string();
-        Arc::new(move |raw_xml: String| {
+        let seq = Arc::new(AtomicU16::new(0));
+        Arc::new(move |tool_text: String| {
             let core = core.clone();
             let req_id = req_id.clone();
+            let seq = seq.clone();
             Box::pin(async move {
                 use crate::ds_core::ChatRequest;
+                let n = seq.fetch_add(1, Ordering::Relaxed);
+                let repair_req_id = format!("{}-repair-{}", req_id, n);
                 let prompt = format!(
-                    "system: repair tool_calls\n\
-                     Fix the following content into a valid JSON array of tool calls. \
-                     Each element must have \"name\" (string) and \"arguments\" (object). \
-                     Output ONLY the JSON array, no markdown, no explanation.\n\n\
-                     Content to fix:\n{raw_xml}"
+                    "请将以下代码块中的内容提取并转换为合法的工具调用 JSON 数组。\
+                     \n每个元素必须包含 \"name\"（字符串）和 \"arguments\"（对象）字段。\
+                     \n只输出 JSON 数组本身，不要加 code fence，不要其他文字解释。\
+                     \n\n需要修复的内容：\n~~~\n{tool_text}\n~~~"
                 );
                 let req = ChatRequest {
                     prompt,
                     thinking_enabled: false,
                     search_enabled: false,
                     model_type: "default".to_string(),
+                    files: vec![],
                 };
+                log::debug!(
+                    target: "adapter",
+                    "{} 发起修复请求: len={}", repair_req_id, tool_text.len()
+                );
                 let resp = core
-                    .v0_chat(req, &req_id)
+                    .v0_chat(req, &repair_req_id)
                     .await
                     .map_err(OpenAIAdapterError::from)?;
                 response::execute_tool_repair(resp.stream).await
@@ -230,7 +238,7 @@ pub enum OpenAIAdapterError {
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// tool_calls XML 解析失败，携带 `<tool_calls>...</tool_calls>` 内的原始文本
+    /// tool_calls 标记解析失败，携带 `{TOOL_CALL_START}...{TOOL_CALL_END}` 内的原始文本
     #[error("tool_calls repair needed: {0}")]
     ToolCallRepairNeeded(String),
 }

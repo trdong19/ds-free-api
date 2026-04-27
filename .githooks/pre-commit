@@ -4,3 +4,4 @@ set -euo pipefail
 cd "$(git rev-parse --git-dir)/.."
 
 just check
+cargo test

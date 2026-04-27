@@ -9,6 +9,8 @@ mod sse_parser;
 mod state;
 mod tool_parser;
 
+pub(crate) use tool_parser::{TOOL_CALL_END, TOOL_CALL_START};
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -113,10 +115,15 @@ pub(crate) async fn execute_tool_repair(
         }
     }
 
-    let wrapped = if text.contains("<tool_calls>") {
+    let wrapped = if text.contains(tool_parser::TOOL_CALL_START) {
         text.trim().to_string()
     } else {
-        format!("<tool_calls>{}</tool_calls>", text.trim())
+        format!(
+            "{}{}{}",
+            tool_parser::TOOL_CALL_START,
+            text.trim(),
+            tool_parser::TOOL_CALL_END
+        )
     };
 
     let (calls, _) = tool_parser::parse_tool_calls(&wrapped).ok_or_else(|| {
@@ -178,17 +185,17 @@ impl Stream for RepairStream {
                             return Poll::Ready(Some(Ok(chunk)));
                         }
                         Some(Poll::Ready(Some(Err(OpenAIAdapterError::ToolCallRepairNeeded(
-                            raw_xml,
+                            tool_text,
                         ))))) => {
                             warn!(
                                 target: "adapter",
                                 "RepairStream 捕获修复请求: len={}",
-                                raw_xml.len()
+                                tool_text.len()
                             );
-                            trace!(target: "adapter", ">>> repair: accepting raw_xml len={}", raw_xml.len());
+                            trace!(target: "adapter", ">>> repair: accepting tool_text len={}", tool_text.len());
                             drop(this.inner.as_mut().get_mut().take());
                             if let Some(f) = this.repair_fn.take() {
-                                let future = f(raw_xml);
+                                let future = f(tool_text);
                                 *this.state = RepairState::Repairing { future };
                             } else {
                                 *this.state =
@@ -414,9 +421,10 @@ where
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| OpenAIAdapterError::Internal(format!("UTF-8 error: {e}")))?;
 
-        let body = text
-            .strip_prefix("data: ")
-            .ok_or_else(|| OpenAIAdapterError::Internal("unexpected SSE format".into()))?;
+        let body = match text.strip_prefix("data: ") {
+            Some(body) => body,
+            None => continue, // 跳过非 data 行（保活注释等）
+        };
         let body = body.strip_suffix("\n\n").unwrap_or(body);
 
         let v: Value = serde_json::from_str(body).map_err(OpenAIAdapterError::from)?;
@@ -532,6 +540,25 @@ mod tests {
         Ok(Bytes::from(body.to_string()))
     }
 
+    fn tool_span(content: &str) -> String {
+        format!(
+            "{}{}{}",
+            tool_parser::TOOL_CALL_START,
+            content,
+            tool_parser::TOOL_CALL_END
+        )
+    }
+
+    fn tool_span_ts(content: &str, suffix: &str) -> String {
+        format!(
+            "{}{}{}{}",
+            tool_parser::TOOL_CALL_START,
+            content,
+            tool_parser::TOOL_CALL_END,
+            suffix
+        )
+    }
+
     /// 将内容拆分为流式 DS SSE 帧序列，模拟字符级输出（每 ~3 字符一片）
     /// - pieces: 按顺序排列的 (内容, 片段类型) 对，类型变化时自动插入新 fragment 事件
     fn make_ds_stream(
@@ -633,8 +660,8 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_tool_calls() {
-        let tool_xml = r#"<tool_calls>[{"name": "get_weather", "arguments": {"city": "beijing"}}]</tool_calls>"#;
-        let frames = make_ds_stream(&[(tool_xml, "RESPONSE")], None);
+        let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "beijing"}}]"#);
+        let frames = make_ds_stream(&[(&tool_xml, "RESPONSE")], None);
         let stream = futures::stream::iter(frames);
         let json = aggregate(stream, "deepseek-default".into(), vec![], 0, None)
             .await
@@ -656,9 +683,11 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_tool_calls_with_trailing_text() {
-        let tool_xml =
-            r#"<tool_calls>[{"name": "get_weather", "arguments": {}}]</tool_calls> trailing text"#;
-        let frames = make_ds_stream(&[(tool_xml, "RESPONSE")], None);
+        let tool_xml = tool_span_ts(
+            r#"[{"name": "get_weather", "arguments": {}}]"#,
+            " trailing text",
+        );
+        let frames = make_ds_stream(&[(&tool_xml, "RESPONSE")], None);
         let stream = futures::stream::iter(frames);
         let json = aggregate(stream, "deepseek-default".into(), vec![], 0, None)
             .await
@@ -667,7 +696,6 @@ mod tests {
         println!("\n=== AGGREGATED RESPONSE (tool_calls + trailing text) ===");
         println!("{}", serde_json::to_string_pretty(&completion).unwrap());
         println!("========================================================\n");
-        // 尾随文本被 ToolCallStream 丢弃（与流式行为一致），仅保留 tool_calls
         assert_eq!(completion["choices"][0]["message"]["content"], "");
         let calls = completion["choices"][0]["message"]["tool_calls"]
             .as_array()
@@ -716,24 +744,26 @@ mod tests {
         let repair_fn = adapter.create_repair_fn("repair-test");
 
         // 多种真实中毒场景：模型输出的 tool_calls 格式损坏
-        let cases: &[(&str, &str)] = &[
+        let cases: Vec<(&str, String)> = vec![
             (
                 "括号不闭合",
-                r#"<tool_calls>{"name": "get_weather", "arguments": {"city": "Beijing"}</tool_calls>"#,
+                tool_span(r#"{"name": "get_weather", "arguments": {"city": "Beijing"}"#),
             ),
             (
                 "括号样式不一致 — [ 与 } 混用",
-                r#"<tool_calls>[{"name": "get_weather", "arguments": {"city": "Beijing"}]}</tool_calls>"#,
+                tool_span(r#"[{"name": "get_weather", "arguments": {"city": "Beijing"}]}"#),
             ),
             (
                 "XML 风格 — 模型输出 XML 标签而非 JSON",
-                r#"<tool_calls><function><name>get_weather</name><arguments>{"city":"Beijing"}</arguments></function></tool_calls>"#,
+                tool_span(
+                    r#"<function><name>get_weather</name><arguments>{"city":"Beijing"}</arguments></function>"#,
+                ),
             ),
         ];
 
         let mut failures = 0u32;
-        for (label, tool_xml) in cases {
-            let frames = make_ds_stream(&[(tool_xml, "RESPONSE")], None);
+        for (label, tool_xml) in &cases {
+            let frames = make_ds_stream(&[(tool_xml.as_str(), "RESPONSE")], None);
             let bytes_stream = futures::stream::iter(frames);
 
             let chunks = collect_chunks(super::stream(
@@ -868,8 +898,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_calls() {
-        let tool_xml = r#"<tool_calls>[{"name": "f", "arguments": {}}]</tool_calls>"#;
-        let frames = make_ds_stream(&[(tool_xml, "RESPONSE")], None);
+        let tool_xml = tool_span(r#"[{"name": "f", "arguments": {}}]"#);
+        let frames = make_ds_stream(&[(&tool_xml, "RESPONSE")], None);
         let bytes_stream = futures::stream::iter(frames);
         let chunks = collect_chunks(super::stream(
             bytes_stream,
@@ -888,21 +918,18 @@ mod tests {
         println!("===================================\n");
         assert!(chunks.len() >= 2);
         assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
-        // 某个 chunk 应包含 tool_calls
         let has_tool_calls = chunks
             .iter()
             .any(|c| c["choices"][0]["delta"]["tool_calls"].as_array().is_some());
         assert!(has_tool_calls, "should have a tool_calls chunk");
-        // content 不应包含 <tool_calls> 残留
         let all_content: String = chunks
             .iter()
             .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
             .collect();
         assert!(
-            !all_content.contains("<tool_calls>"),
+            !all_content.contains(tool_parser::TOOL_CALL_START),
             "content should not contain tool_calls tags"
         );
-        // finish
         assert_eq!(
             chunks.last().unwrap()["choices"][0]["finish_reason"],
             "tool_calls"
@@ -911,9 +938,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_fragmented_tool_calls_with_thinking() {
-        let tool_xml =
-            r#"<tool_calls>[{"name": "get_weather", "arguments": {"city": "北京"}}]</tool_calls>"#;
-        let frames = make_ds_stream(&[("思考中", "THINK"), (tool_xml, "RESPONSE")], None);
+        let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "北京"}}]"#);
+        let frames = make_ds_stream(&[("思考中", "THINK"), (&tool_xml, "RESPONSE")], None);
         let bytes_stream = futures::stream::iter(frames);
         let chunks = collect_chunks(super::stream(
             bytes_stream,
@@ -1072,9 +1098,9 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_tool_calls_with_leading_text() {
-        let tool_xml = r#"<tool_calls>[{"name": "get_weather", "arguments": {"city": "beijing"}}]</tool_calls>"#;
+        let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "beijing"}}]"#);
         let frames = make_ds_stream(
-            &[("好的，我来帮你。", "RESPONSE"), (tool_xml, "RESPONSE")],
+            &[("好的，我来帮你。", "RESPONSE"), (&tool_xml, "RESPONSE")],
             None,
         );
         let stream = futures::stream::iter(frames);
@@ -1101,11 +1127,13 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_calls_with_leading_text_fragmented() {
-        let tool_xml = r#"<tool_calls>[{"name": "astrbot_execute_shell", "arguments": {"command": "cat /data/astrbot/skills/doubao-image-gen/SKILL.md"}}]</tool_calls>"#;
+        let tool_xml = tool_span(
+            r#"[{"name": "astrbot_execute_shell", "arguments": {"command": "cat /data/astrbot/skills/doubao-image-gen/SKILL.md"}}]"#,
+        );
         let frames = make_ds_stream(
             &[
                 ("好的，我来帮你用豆包生成图片。", "RESPONSE"),
-                (tool_xml, "RESPONSE"),
+                (&tool_xml, "RESPONSE"),
             ],
             None,
         );
@@ -1158,9 +1186,9 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_calls_with_leading_text_multi_chunk_fragments() {
-        let tool_xml = r#"<tool_calls>[{"name": "f", "arguments": {}}]</tool_calls>"#;
+        let tool_xml = tool_span(r#"[{"name": "f", "arguments": {}}]"#);
         let frames = make_ds_stream(
-            &[("让我来查一下。", "RESPONSE"), (tool_xml, "RESPONSE")],
+            &[("让我来查一下。", "RESPONSE"), (&tool_xml, "RESPONSE")],
             None,
         );
         let bytes_stream = futures::stream::iter(frames);
@@ -1200,13 +1228,13 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_calls_with_thinking_then_leading_text_then_fragmented_json() {
-        // 最完整的生产场景：thinking -> leading text -> 碎片化 <tool_calls>
-        let tool_xml = r#"<tool_calls>[{"name": "get_weather", "arguments": {"city": "beijing"}}]</tool_calls>"#;
+        // 最完整的生产场景：thinking -> leading text -> 碎片化 tool_calls
+        let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "beijing"}}]"#);
         let frames = make_ds_stream(
             &[
                 ("用户要查天气，我需要调用工具", "THINK"),
                 ("好的，我来帮你查一下。", "RESPONSE"),
-                (tool_xml, "RESPONSE"),
+                (&tool_xml, "RESPONSE"),
             ],
             None,
         );
@@ -1247,8 +1275,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_calls_json_split_right_after_tag() {
-        let tool_xml = r#"<tool_calls>[{"name": "f", "arguments": {}}]</tool_calls>"#;
-        let frames = make_ds_stream(&[("好的。", "RESPONSE"), (tool_xml, "RESPONSE")], None);
+        let tool_xml = tool_span(r#"[{"name": "f", "arguments": {}}]"#);
+        let frames = make_ds_stream(&[("好的。", "RESPONSE"), (&tool_xml, "RESPONSE")], None);
         let bytes_stream = futures::stream::iter(frames);
         let chunks = collect_chunks(super::stream(
             bytes_stream,
@@ -1275,8 +1303,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_calls_no_leading_text() {
-        let tool_xml = r#"<tool_calls>[{"name": "get_weather", "arguments": {"city": "beijing"}}]</tool_calls>"#;
-        let frames = make_ds_stream(&[(tool_xml, "RESPONSE")], None);
+        let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "beijing"}}]"#);
+        let frames = make_ds_stream(&[(&tool_xml, "RESPONSE")], None);
         let bytes_stream = futures::stream::iter(frames);
         let chunks = collect_chunks(super::stream(
             bytes_stream,

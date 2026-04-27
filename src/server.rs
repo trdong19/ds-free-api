@@ -7,12 +7,13 @@ mod handlers;
 mod stream;
 
 use axum::{
-    Router,
+    Json, Router,
     extract::Request,
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -53,8 +54,9 @@ fn build_router(state: AppState, api_tokens: &[crate::config::ApiToken]) -> Rout
     let has_auth = !api_tokens.is_empty();
     let tokens: Vec<String> = api_tokens.iter().map(|t| t.token.clone()).collect();
 
-    let mut router = Router::new()
-        .route("/", get(|| async { "ai-free-api" }))
+    let public = Router::new().route("/", get(root));
+
+    let protected = Router::new()
         // OpenAI
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/models", get(handlers::list_models))
@@ -65,17 +67,39 @@ fn build_router(state: AppState, api_tokens: &[crate::config::ApiToken]) -> Rout
         .route(
             "/anthropic/v1/models/{id}",
             get(handlers::anthropic_get_model),
-        )
-        .with_state(state);
+        );
 
-    if has_auth {
-        router = router.layer(middleware::from_fn(move |req, next| {
+    let router = if has_auth {
+        public.merge(protected.layer(middleware::from_fn(move |req, next| {
             let tokens = tokens.clone();
             async move { auth_middleware(req, next, tokens).await }
-        }));
-    }
+        })))
+    } else {
+        public.merge(protected)
+    };
 
-    router
+    router.with_state(state)
+}
+
+#[derive(Serialize)]
+struct RootResponse {
+    endpoints: Vec<String>,
+    message: &'static str,
+}
+
+async fn root() -> Json<RootResponse> {
+    Json(RootResponse {
+        endpoints: vec![
+            "GET /".into(),
+            "POST /v1/chat/completions".into(),
+            "GET /v1/models".into(),
+            "GET /v1/models/{id}".into(),
+            "POST /anthropic/v1/messages".into(),
+            "GET /anthropic/v1/models".into(),
+            "GET /anthropic/v1/models/{id}".into(),
+        ],
+        message: "https://github.com/NIyueeE/ds-free-api",
+    })
 }
 
 /// API Token 鉴权中间件
