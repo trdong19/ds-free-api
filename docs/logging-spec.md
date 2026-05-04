@@ -63,20 +63,79 @@ debug!(target: "ds_core::accounts", "health_check model_type={}", model_type);
 ### 响应转换层（openai_adapter/）
 
 ```rust
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
+
+// DEBUG: 适配器入口（请求开始处理）
+debug!(target: "adapter", "req={} 适配器开始处理: model={}, stream={}", request_id, model, stream);
+
+// DEBUG: 响应管道初始化
+debug!(target: "adapter", "构建流式响应: model={}, include_usage={}, include_obfuscation={}, stop_count={}, repair={}", model, usage, obfuscation, stop, repair);
+
+// DEBUG: 非流式响应聚合完成
+debug!(target: "adapter", "非流式响应聚合完成: finish_reason={:?}, has_tool_calls={}", reason, has_tc);
 
 // TRACE: 原始 SSE 事件
 trace!(target: "adapter", "<<< {} {}", event, data);
 
+// TRACE: 状态机帧输出
+trace!(target: "adapter", ">>> state: {frame}");
+
+// TRACE: 转换器增量
+trace!(target: "adapter", ">>> conv: content delta len={}", len);
+
+// TRACE: 序列化后的 chunk
+trace!(target: "adapter", ">>> {}", chunk_json);
+
 // WARN: SSE 流中断（上游连接异常）
 warn!(target: "adapter", "SSE 流错误: {}", e);
 
-// WARN: tool_parser 修复触发
+// WARN: tool_parser 解析失败→请求修复
 warn!(target: "adapter", "tool_parser 解析失败→请求修复");
+
+// WARN: 转换器流提前结束
+warn!(target: "adapter", "转换器流提前结束: model={}, usage_value={:?}", model, usage);
+
+// WARN: 工具调用修复失败
+warn!(target: "adapter", "tool_calls 修复失败: {}", e);
+
+// INFO: 重试成功
+info!(target: "adapter", "req={} 第 {} 次重试成功", request_id, attempt);
 
 // DEBUG: 正常解析
 debug!(target: "adapter", "tool_parser 解析出 {} 个工具调用", count);
 ```
+
+### 编排层（ds_core/completions + accounts）
+
+```rust
+use log::{debug, error, info, trace, warn};
+
+// INFO: 账号初始化关键事件
+info!(target: "ds_core::accounts", "账号 {} 初始化成功", display_id);
+
+// DEBUG: 请求编排过程
+debug!(target: "ds_core::accounts", "req={} 分配账号: model_type={}", request_id, model_type);
+debug!(target: "ds_core::accounts", "req={} 创建 session: id={}", request_id, session_id);
+debug!(target: "ds_core::accounts", "req={} completion PoW 计算完成", request_id);
+debug!(target: "ds_core::accounts", "req={} SSE ready: resp_msg={}", request_id, stop_id);
+
+// TRACE: 原始 SSE 字节
+trace!(target: "ds_core::accounts", "req={} <<< ({} bytes) {}", request_id, len, content);
+
+// WARN: 账号初始化失败（单个可降级）
+warn!(target: "ds_core::accounts", "账号 {} 初始化失败: {}", display_id, e);
+
+// WARN: 账号池耗尽
+warn!(target: "ds_core::accounts", "req={} 账号池无可用账号", request_id);
+
+// WARN: 限流 / 上传失败
+warn!(target: "ds_core::accounts", "req={} hint 限流: rate_limit_reached", request_id);
+
+// ERROR: 所有账号全部失败
+error!(target: "ds_core::accounts", "所有账号初始化失败");
+```
+
+### 应用层（examples/ / main.rs / server/）
 
 ### 应用层（examples/ / main.rs / server/）
 

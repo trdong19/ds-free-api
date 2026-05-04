@@ -1,153 +1,20 @@
-//! 流式响应映射 —— 将 OpenAI ChatCompletionChunk SSE 流映射为 Anthropic Message SSE 流
+//! 流式响应映射 —— 将 ChatCompletionsResponseChunk 流映射为 MessagesResponseChunk 流
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use futures::Stream;
 use log::{debug, trace};
 use pin_project_lite::pin_project;
-use serde::Serialize;
 
-use super::{ContentBlock, Message, Usage, finish_reason_map, map_id};
 use crate::anthropic_compat::AnthropicCompatError;
+use crate::anthropic_compat::types::{
+    ContentBlockDelta, MessagesResponse, MessagesResponseChunk, ResponseContentBlock, Usage,
+};
 use crate::openai_adapter::OpenAIAdapterError;
+use crate::openai_adapter::types::ChatCompletionsResponseChunk;
 
-// ============================================================================
-// Anthropic 流式事件类型
-// ============================================================================
-
-#[derive(Debug, Serialize)]
-struct MessageStartEvent {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    message: Message,
-}
-
-#[derive(Debug, Serialize)]
-struct ContentBlockStartEvent {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    index: usize,
-    content_block: ContentBlock,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-enum ContentBlockDelta {
-    #[serde(rename = "text_delta")]
-    Text { text: String },
-    #[serde(rename = "thinking_delta")]
-    Thinking { thinking: String },
-    #[serde(rename = "input_json_delta")]
-    InputJson { partial_json: String },
-}
-
-#[derive(Debug, Serialize)]
-struct ContentBlockDeltaEvent {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    index: usize,
-    delta: ContentBlockDelta,
-}
-
-#[derive(Debug, Serialize)]
-struct ContentBlockStopEvent {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    index: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct MessageDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stop_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stop_sequence: Option<String>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct MessageDeltaUsage {
-    output_tokens: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct MessageDeltaEvent {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    delta: MessageDelta,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<MessageDeltaUsage>,
-}
-
-#[derive(Debug, Serialize)]
-struct MessageStopEvent {
-    #[serde(rename = "type")]
-    ty: &'static str,
-}
-
-// ============================================================================
-// OpenAI chunk 反序列化（最小化结构）
-// ============================================================================
-
-#[derive(Debug, serde::Deserialize)]
-struct OpenAiChunk {
-    id: String,
-    model: String,
-    choices: Vec<OpenAiChunkChoice>,
-    #[serde(default)]
-    usage: Option<super::OpenAiUsage>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct OpenAiChunkChoice {
-    #[serde(default)]
-    finish_reason: Option<String>,
-    delta: OpenAiDelta,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-struct OpenAiDelta {
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<super::OpenAiToolCall>>,
-}
-
-// ============================================================================
-// SSE 解析缓冲
-// ============================================================================
-
-struct SseBuffer {
-    buf: String,
-}
-
-impl SseBuffer {
-    fn new() -> Self {
-        Self { buf: String::new() }
-    }
-
-    fn feed(&mut self, bytes: &Bytes) -> Vec<String> {
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
-        let mut events = Vec::new();
-        while let Some(pos) = self.buf.find("\n\n") {
-            let event = self.buf[..pos].to_string();
-            self.buf.drain(..pos + 2);
-            for line in event.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    events.push(data.to_string());
-                    break;
-                }
-            }
-        }
-        events
-    }
-}
+use super::{finish_reason_map, map_id};
 
 // ============================================================================
 // 状态机
@@ -173,13 +40,13 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn new(input_tokens: u32) -> Self {
+    fn new() -> Self {
         Self {
             block_kind: BlockKind::None,
             block_index: 0,
             model: String::new(),
             message_id: String::new(),
-            input_tokens,
+            input_tokens: 0,
             completion_tokens: None,
             started: false,
             finished: false,
@@ -192,10 +59,9 @@ impl StreamState {
         self.started = true;
     }
 
-    fn make_message_start(&self) -> MessageStartEvent {
-        MessageStartEvent {
-            ty: "message_start",
-            message: Message {
+    fn make_message_start(&self) -> MessagesResponseChunk {
+        MessagesResponseChunk::MessageStart {
+            message: MessagesResponse {
                 id: self.message_id.clone(),
                 ty: "message",
                 role: "assistant",
@@ -211,10 +77,10 @@ impl StreamState {
         }
     }
 
-    fn transition_to(&mut self, kind: BlockKind) -> Vec<StreamEvent> {
+    fn transition_to(&mut self, kind: BlockKind) -> Vec<MessagesResponseChunk> {
         let mut events = Vec::new();
         if self.block_kind != BlockKind::None {
-            events.push(StreamEvent::ContentBlockStop {
+            events.push(MessagesResponseChunk::ContentBlockStop {
                 index: self.block_index,
             });
             self.block_index += 1;
@@ -223,28 +89,51 @@ impl StreamState {
         events
     }
 
-    fn handle_chunk(&mut self, chunk: OpenAiChunk) -> Vec<StreamEvent> {
+    fn handle_chunk(&mut self, chunk: ChatCompletionsResponseChunk) -> Vec<MessagesResponseChunk> {
         let mut events = Vec::new();
 
-        // role chunk → message_start
+        // 保活块 → 持续 thinking 块（不要独立块免干扰客户端）
+        if chunk.id == "chatcmpl-keepalive" && self.started {
+            if self.block_kind != BlockKind::Thinking {
+                events.extend(self.transition_to(BlockKind::Thinking));
+                events.push(MessagesResponseChunk::ContentBlockStart {
+                    index: self.block_index,
+                    content_block: ResponseContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: String::new(),
+                    },
+                });
+            }
+            events.push(MessagesResponseChunk::ContentBlockDelta {
+                index: self.block_index,
+                delta: ContentBlockDelta::Thinking {
+                    thinking: "tool_calls...".to_string(),
+                },
+            });
+            return events;
+        }
+
+        // role chunk → message_start（此时 chunk 已携带 prompt_tokens）
         if !self.started
             && let Some(choice) = chunk.choices.first()
-            && choice.delta.role.is_some()
+            && choice.delta.role == Some("assistant")
         {
             self.start(chunk.id, chunk.model);
-            events.push(StreamEvent::MessageStart(self.make_message_start()));
+            if let Some(ref u) = chunk.usage {
+                self.input_tokens = u.prompt_tokens;
+            }
+            events.push(self.make_message_start());
             return events;
+        }
+
+        // 优先提取 usage（可能独立 chunk 或与 finish 同 chunk）
+        if let Some(ref u) = chunk.usage {
+            self.completion_tokens = Some(u.completion_tokens);
         }
 
         let choice = match chunk.choices.first() {
             Some(c) => c,
-            None => {
-                // usage-only chunk
-                if let Some(u) = chunk.usage {
-                    self.completion_tokens = Some(u.completion_tokens);
-                }
-                return events;
-            }
+            None => return events,
         };
 
         let delta = &choice.delta;
@@ -255,15 +144,15 @@ impl StreamState {
         {
             if self.block_kind != BlockKind::Thinking {
                 events.extend(self.transition_to(BlockKind::Thinking));
-                events.push(StreamEvent::ContentBlockStart {
+                events.push(MessagesResponseChunk::ContentBlockStart {
                     index: self.block_index,
-                    content_block: ContentBlock::Thinking {
+                    content_block: ResponseContentBlock::Thinking {
                         thinking: String::new(),
                         signature: String::new(),
                     },
                 });
             }
-            events.push(StreamEvent::ContentBlockDelta {
+            events.push(MessagesResponseChunk::ContentBlockDelta {
                 index: self.block_index,
                 delta: ContentBlockDelta::Thinking {
                     thinking: text.clone(),
@@ -277,14 +166,14 @@ impl StreamState {
         {
             if self.block_kind != BlockKind::Text {
                 events.extend(self.transition_to(BlockKind::Text));
-                events.push(StreamEvent::ContentBlockStart {
+                events.push(MessagesResponseChunk::ContentBlockStart {
                     index: self.block_index,
-                    content_block: ContentBlock::Text {
+                    content_block: ResponseContentBlock::Text {
                         text: String::new(),
                     },
                 });
             }
-            events.push(StreamEvent::ContentBlockDelta {
+            events.push(MessagesResponseChunk::ContentBlockDelta {
                 index: self.block_index,
                 delta: ContentBlockDelta::Text { text: text.clone() },
             });
@@ -305,143 +194,42 @@ impl StreamState {
                 } else {
                     (String::new(), "{}".to_string())
                 };
-                trace!(target: "anthropic_compat::response::stream", "tool_use block: id={}, name={}, partial_json={}", call.id, name, partial_json);
-                events.push(StreamEvent::ContentBlockStart {
+                events.push(MessagesResponseChunk::ContentBlockStart {
                     index: self.block_index,
-                    content_block: ContentBlock::ToolUse {
+                    content_block: ResponseContentBlock::ToolUse {
                         id: map_id(&call.id),
                         name: name.clone(),
                         input: serde_json::json!({}),
                     },
                 });
-                events.push(StreamEvent::ContentBlockDelta {
+                events.push(MessagesResponseChunk::ContentBlockDelta {
                     index: self.block_index,
                     delta: ContentBlockDelta::InputJson { partial_json },
                 });
-                events.push(StreamEvent::ContentBlockStop {
+                events.push(MessagesResponseChunk::ContentBlockStop {
                     index: self.block_index,
                 });
                 self.block_index += 1;
             }
-            // tool_use 是每个 call 一个 block，最后一个已经 +1 了
-            // 但 transition_to 时已经设为 ToolUse，现在设为 None 表示当前无活跃 block
             self.block_kind = BlockKind::None;
         }
 
         // finish_reason
-        if let Some(ref reason) = choice.finish_reason
+        if let Some(reason) = choice.finish_reason
             && !self.finished
         {
             self.finished = true;
             events.extend(self.transition_to(BlockKind::None));
             let stop_reason = finish_reason_map(reason);
-            events.push(StreamEvent::MessageDelta {
-                delta: MessageDelta {
-                    stop_reason: Some(stop_reason),
-                    stop_sequence: None,
-                },
-                usage: Some(MessageDeltaUsage {
-                    output_tokens: self.completion_tokens.unwrap_or(0),
-                }),
+            events.push(MessagesResponseChunk::MessageDelta {
+                stop_reason: Some(stop_reason),
+                stop_sequence: None,
+                output_tokens: Some(self.completion_tokens.unwrap_or(0)),
             });
-            events.push(StreamEvent::MessageStop);
+            events.push(MessagesResponseChunk::MessageStop);
         }
 
         events
-    }
-}
-
-// ============================================================================
-// 内部事件枚举（序列化前中间表示）
-// ============================================================================
-
-enum StreamEvent {
-    MessageStart(MessageStartEvent),
-    ContentBlockStart {
-        index: usize,
-        content_block: ContentBlock,
-    },
-    ContentBlockDelta {
-        index: usize,
-        delta: ContentBlockDelta,
-    },
-    ContentBlockStop {
-        index: usize,
-    },
-    MessageDelta {
-        delta: MessageDelta,
-        usage: Option<MessageDeltaUsage>,
-    },
-    MessageStop,
-}
-
-impl StreamEvent {
-    fn to_sse_bytes(&self) -> Result<Bytes, serde_json::Error> {
-        let json = match self {
-            StreamEvent::MessageStart(e) => serde_json::to_string(e)?,
-            StreamEvent::ContentBlockStart {
-                index,
-                content_block,
-            } => serde_json::to_string(&ContentBlockStartEvent {
-                ty: "content_block_start",
-                index: *index,
-                content_block: content_block.clone(),
-            })?,
-            StreamEvent::ContentBlockDelta { index, delta } => {
-                serde_json::to_string(&ContentBlockDeltaEvent {
-                    ty: "content_block_delta",
-                    index: *index,
-                    delta: match delta {
-                        ContentBlockDelta::Text { text } => {
-                            ContentBlockDelta::Text { text: text.clone() }
-                        }
-                        ContentBlockDelta::Thinking { thinking } => ContentBlockDelta::Thinking {
-                            thinking: thinking.clone(),
-                        },
-                        ContentBlockDelta::InputJson { partial_json } => {
-                            ContentBlockDelta::InputJson {
-                                partial_json: partial_json.clone(),
-                            }
-                        }
-                    },
-                })?
-            }
-            StreamEvent::ContentBlockStop { index } => {
-                serde_json::to_string(&ContentBlockStopEvent {
-                    ty: "content_block_stop",
-                    index: *index,
-                })?
-            }
-            StreamEvent::MessageDelta { delta, usage } => {
-                serde_json::to_string(&MessageDeltaEvent {
-                    ty: "message_delta",
-                    delta: MessageDelta {
-                        stop_reason: delta.stop_reason.clone(),
-                        stop_sequence: delta.stop_sequence.clone(),
-                    },
-                    usage: usage.clone(),
-                })?
-            }
-            StreamEvent::MessageStop => {
-                serde_json::to_string(&MessageStopEvent { ty: "message_stop" })?
-            }
-        };
-        Ok(Bytes::from(format!(
-            "event: {}\ndata: {}\n\n",
-            self.event_name(),
-            json
-        )))
-    }
-
-    fn event_name(&self) -> &'static str {
-        match self {
-            StreamEvent::MessageStart(_) => "message_start",
-            StreamEvent::ContentBlockStart { .. } => "content_block_start",
-            StreamEvent::ContentBlockDelta { .. } => "content_block_delta",
-            StreamEvent::ContentBlockStop { .. } => "content_block_stop",
-            StreamEvent::MessageDelta { .. } => "message_delta",
-            StreamEvent::MessageStop => "message_stop",
-        }
     }
 }
 
@@ -454,17 +242,15 @@ pin_project! {
         #[pin]
         inner: S,
         state: StreamState,
-        buffer: SseBuffer,
-        pending_events: Vec<StreamEvent>,
+        pending_events: Vec<MessagesResponseChunk>,
     }
 }
 
 impl<S> AnthropicStream<S> {
-    fn new(inner: S, input_tokens: u32) -> Self {
+    fn new(inner: S) -> Self {
         Self {
             inner,
-            state: StreamState::new(input_tokens),
-            buffer: SseBuffer::new(),
+            state: StreamState::new(),
             pending_events: Vec::new(),
         }
     }
@@ -472,9 +258,9 @@ impl<S> AnthropicStream<S> {
 
 impl<S> Stream for AnthropicStream<S>
 where
-    S: Stream<Item = Result<Bytes, OpenAIAdapterError>>,
+    S: Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>>,
 {
-    type Item = Result<Bytes, AnthropicCompatError>;
+    type Item = Result<MessagesResponseChunk, AnthropicCompatError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
@@ -482,67 +268,42 @@ where
         // 优先输出待处理事件
         if !this.pending_events.is_empty() {
             let event = this.pending_events.remove(0);
-            return Poll::Ready(Some(event.to_sse_bytes().map_err(|e| {
-                AnthropicCompatError::Internal(format!("json serialization failed: {}", e))
-            })));
+            return Poll::Ready(Some(Ok(event)));
         }
 
         loop {
             match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    trace!(target: "anthropic_compat::response::stream", "收到 SSE 字节: {} bytes", bytes.len());
-                    let datas = this.buffer.feed(&bytes);
-                    for data in datas {
-                        let chunk: OpenAiChunk = match serde_json::from_str(&data) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                return Poll::Ready(Some(Err(AnthropicCompatError::Internal(
-                                    format!("json parse failed: {}", e),
-                                ))));
-                            }
-                        };
-                        let events = this.state.handle_chunk(chunk);
-                        this.pending_events.extend(events);
-                    }
+                Poll::Ready(Some(Ok(chunk))) => {
+                    trace!(target: "anthropic_compat::response::stream", "<<< {}",
+                        serde_json::to_string(&chunk).unwrap_or_default());
+                    let events = this.state.handle_chunk(chunk);
+                    this.pending_events.extend(events);
                     if !this.pending_events.is_empty() {
                         let event = this.pending_events.remove(0);
-                        return Poll::Ready(Some(event.to_sse_bytes().map_err(|e| {
-                            AnthropicCompatError::Internal(format!(
-                                "json serialization failed: {}",
-                                e
-                            ))
-                        })));
+                        return Poll::Ready(Some(Ok(event)));
                     }
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(AnthropicCompatError::from(e))));
                 }
                 Poll::Ready(None) => {
-                    debug!(target: "anthropic_compat::response::stream", "OpenAI 流结束, started={}, finished={}", this.state.started, this.state.finished);
+                    debug!(target: "anthropic_compat::response::stream", "流结束, started={}, finished={}", this.state.started, this.state.finished);
                     // 流结束但未收到 finish_reason：优雅关闭
                     if !this.state.finished && this.state.started {
                         this.state.finished = true;
-                        let mut events = this.state.transition_to(BlockKind::None);
-                        events.push(StreamEvent::MessageDelta {
-                            delta: MessageDelta {
-                                stop_reason: None,
-                                stop_sequence: None,
-                            },
-                            usage: Some(MessageDeltaUsage {
-                                output_tokens: this.state.completion_tokens.unwrap_or(0),
-                            }),
+                        let mut events: Vec<MessagesResponseChunk> =
+                            this.state.transition_to(BlockKind::None);
+                        events.push(MessagesResponseChunk::MessageDelta {
+                            stop_reason: None,
+                            stop_sequence: None,
+                            output_tokens: Some(this.state.completion_tokens.unwrap_or(0)),
                         });
-                        events.push(StreamEvent::MessageStop);
+                        events.push(MessagesResponseChunk::MessageStop);
                         this.pending_events.extend(events);
                     }
                     if !this.pending_events.is_empty() {
                         let event = this.pending_events.remove(0);
-                        return Poll::Ready(Some(event.to_sse_bytes().map_err(|e| {
-                            AnthropicCompatError::Internal(format!(
-                                "json serialization failed: {}",
-                                e
-                            ))
-                        })));
+                        return Poll::Ready(Some(Ok(event)));
                     }
                     return Poll::Ready(None);
                 }
@@ -556,249 +317,502 @@ where
 // 公共入口
 // ============================================================================
 
-/// 将 OpenAI ChatCompletionChunk SSE 流映射为 Anthropic Message SSE 流
+/// 将 ChatCompletionsResponseChunk 流映射为 MessagesResponseChunk 流
 pub fn from_chat_completion_stream<S>(
     openai_stream: S,
-    input_tokens: u32,
-) -> Pin<Box<dyn Stream<Item = Result<Bytes, AnthropicCompatError>> + Send>>
+) -> Pin<Box<dyn Stream<Item = Result<MessagesResponseChunk, AnthropicCompatError>> + Send>>
 where
-    S: Stream<Item = Result<Bytes, OpenAIAdapterError>> + Send + 'static,
+    S: Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send + 'static,
 {
-    debug!(target: "anthropic_compat::response::stream", "启动流式响应映射, input_tokens={}", input_tokens);
-    Box::pin(AnthropicStream::new(openai_stream, input_tokens))
+    debug!(target: "anthropic_compat::response::stream", "启动流式响应映射");
+    Box::pin(AnthropicStream::new(openai_stream))
 }
-
-// ============================================================================
-// 测试
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use futures::StreamExt;
 
-    fn openai_sse(data: &str) -> Bytes {
-        Bytes::from(format!("data: {}\n\n", data))
-    }
+    use crate::anthropic_compat::types::{
+        ContentBlockDelta, MessagesResponseChunk, ResponseContentBlock,
+    };
+    use crate::openai_adapter::OpenAIAdapterError;
+    use crate::openai_adapter::types::{
+        ChatCompletionsResponseChunk, ChunkChoice, Delta, FunctionCall, ToolCall, Usage,
+    };
 
-    async fn collect_events(
-        st: Pin<Box<dyn Stream<Item = Result<Bytes, AnthropicCompatError>> + Send>>,
-    ) -> Vec<(String, serde_json::Value)> {
-        let mut out = Vec::new();
-        let mut st = st;
-        while let Some(res) = st.next().await {
-            let text = String::from_utf8(res.unwrap().to_vec()).unwrap();
-            let mut event_name = String::new();
-            let mut data_json = String::new();
-            for line in text.lines() {
-                if line.starts_with("event: ") {
-                    event_name = line.strip_prefix("event: ").unwrap().to_string();
-                } else if line.starts_with("data: ") {
-                    data_json = line.strip_prefix("data: ").unwrap().to_string();
-                }
-            }
-            out.push((event_name, serde_json::from_str(&data_json).unwrap()));
+    fn role_chunk(model: &str, id: &str) -> ChatCompletionsResponseChunk {
+        ChatCompletionsResponseChunk {
+            id: id.to_string(),
+            object: "chat.completion.chunk",
+            created: 1000,
+            model: model.to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    role: Some("assistant"),
+                    ..Default::default()
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            service_tier: None,
+            system_fingerprint: None,
         }
-        out
+    }
+
+    fn content_chunk(content: &str) -> ChatCompletionsResponseChunk {
+        ChatCompletionsResponseChunk {
+            id: String::new(),
+            object: "chat.completion.chunk",
+            created: 1000,
+            model: String::new(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    content: Some(content.to_string()),
+                    ..Default::default()
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            service_tier: None,
+            system_fingerprint: None,
+        }
+    }
+
+    fn reasoning_chunk(text: &str) -> ChatCompletionsResponseChunk {
+        ChatCompletionsResponseChunk {
+            id: String::new(),
+            object: "chat.completion.chunk",
+            created: 1000,
+            model: String::new(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    reasoning_content: Some(text.to_string()),
+                    ..Default::default()
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            service_tier: None,
+            system_fingerprint: None,
+        }
+    }
+
+    fn tool_chunk(tool_calls: Vec<ToolCall>) -> ChatCompletionsResponseChunk {
+        ChatCompletionsResponseChunk {
+            id: String::new(),
+            object: "chat.completion.chunk",
+            created: 1000,
+            model: String::new(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    tool_calls: Some(tool_calls),
+                    ..Default::default()
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            service_tier: None,
+            system_fingerprint: None,
+        }
+    }
+
+    fn finish_chunk(reason: &'static str) -> ChatCompletionsResponseChunk {
+        ChatCompletionsResponseChunk {
+            id: String::new(),
+            object: "chat.completion.chunk",
+            created: 1000,
+            model: String::new(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta::default(),
+                finish_reason: Some(reason),
+                logprobs: None,
+            }],
+            usage: None,
+            service_tier: None,
+            system_fingerprint: None,
+        }
+    }
+
+    fn usage_chunk(prompt_tokens: u32, completion_tokens: u32) -> ChatCompletionsResponseChunk {
+        ChatCompletionsResponseChunk {
+            id: String::new(),
+            object: "chat.completion.chunk",
+            created: 1000,
+            model: String::new(),
+            choices: vec![],
+            usage: Some(Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
+            service_tier: None,
+            system_fingerprint: None,
+        }
+    }
+
+    fn keepalive_chunk() -> ChatCompletionsResponseChunk {
+        ChatCompletionsResponseChunk {
+            id: "chatcmpl-keepalive".to_string(),
+            object: "chat.completion.chunk",
+            created: 1000,
+            model: String::new(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta::default(),
+                finish_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+            service_tier: None,
+            system_fingerprint: None,
+        }
+    }
+
+    async fn collect(chunks: Vec<ChatCompletionsResponseChunk>) -> Vec<MessagesResponseChunk> {
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, OpenAIAdapterError>));
+        let mut anthropic = super::from_chat_completion_stream(stream);
+        let mut events = Vec::new();
+        while let Some(event) = anthropic.next().await {
+            events.push(event.unwrap());
+        }
+        events
     }
 
     #[tokio::test]
-    async fn stream_plain_text() {
-        let chunks = vec![
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-1","model":"deepseek-default","choices":[{"delta":{"role":"assistant"}}]}"#,
-            )),
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-1","model":"deepseek-default","choices":[{"delta":{"content":"hello"}}]}"#,
-            )),
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-1","model":"deepseek-default","choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}"#,
-            )),
-        ];
-        let events = collect_events(from_chat_completion_stream(
-            futures::stream::iter(chunks),
-            10,
-        ))
+    async fn text_only() {
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-abc"),
+            content_chunk("Hello"),
+            finish_chunk("stop"),
+        ])
         .await;
-
-        assert_eq!(events[0].0, "message_start");
-        assert_eq!(events[0].1["message"]["id"], "msg_1");
-        assert_eq!(events[0].1["message"]["usage"]["input_tokens"], 10);
-        assert_eq!(events[0].1["message"]["usage"]["output_tokens"], 0);
-
-        assert_eq!(events[1].0, "content_block_start");
-        assert_eq!(events[1].1["index"], 0);
-        assert_eq!(events[1].1["content_block"]["type"], "text");
-
-        assert_eq!(events[2].0, "content_block_delta");
-        assert_eq!(events[2].1["delta"]["type"], "text_delta");
-        assert_eq!(events[2].1["delta"]["text"], "hello");
-
-        assert_eq!(events[3].0, "content_block_delta");
-        assert_eq!(events[3].1["delta"]["text"], " world");
-
-        assert_eq!(events[4].0, "content_block_stop");
-        assert_eq!(events[4].1["index"], 0);
-
-        assert_eq!(events[5].0, "message_delta");
-        assert_eq!(events[5].1["delta"]["stop_reason"], "end_turn");
-
-        assert_eq!(events[6].0, "message_stop");
-    }
-
-    #[tokio::test]
-    async fn stream_thinking_then_text() {
-        let chunks = vec![
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-2","model":"deepseek-expert","choices":[{"delta":{"role":"assistant"}}]}"#,
-            )),
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-2","model":"deepseek-expert","choices":[{"delta":{"reasoning_content":"Let me think..."}}]}"#,
-            )),
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-2","model":"deepseek-expert","choices":[{"delta":{"content":"The answer is 42."},"finish_reason":"stop"}]}"#,
-            )),
-        ];
-        let events = collect_events(from_chat_completion_stream(
-            futures::stream::iter(chunks),
-            20,
-        ))
-        .await;
-
+        assert!(!events.is_empty());
         // message_start
-        assert_eq!(events[0].0, "message_start");
-
-        // thinking block
-        assert_eq!(events[1].0, "content_block_start");
-        assert_eq!(events[1].1["content_block"]["type"], "thinking");
-        assert_eq!(events[2].0, "content_block_delta");
-        assert_eq!(events[2].1["delta"]["type"], "thinking_delta");
-        assert_eq!(events[2].1["delta"]["thinking"], "Let me think...");
-        assert_eq!(events[3].0, "content_block_stop");
-
-        // text block
-        assert_eq!(events[4].0, "content_block_start");
-        assert_eq!(events[4].1["content_block"]["type"], "text");
-        assert_eq!(events[5].0, "content_block_delta");
-        assert_eq!(events[5].1["delta"]["text"], "The answer is 42.");
-        assert_eq!(events[6].0, "content_block_stop");
-
-        // finish
-        assert_eq!(events[7].0, "message_delta");
-        assert_eq!(events[7].1["delta"]["stop_reason"], "end_turn");
-        assert_eq!(events[8].0, "message_stop");
+        assert_eq!(events[0].event_name(), "message_start");
+        // content_block_start(text), content_block_delta, content_block_stop
+        assert_eq!(events[1].event_name(), "content_block_start");
+        assert_eq!(events[2].event_name(), "content_block_delta");
+        assert_eq!(events[3].event_name(), "content_block_stop");
+        // message_delta + message_stop
+        assert_eq!(events[4].event_name(), "message_delta");
+        assert_eq!(events[5].event_name(), "message_stop");
+        assert_eq!(events.len(), 6);
     }
 
     #[tokio::test]
-    async fn stream_tool_calls() {
-        let chunks = vec![
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-3","model":"deepseek-default","choices":[{"delta":{"role":"assistant"}}]}"#,
-            )),
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-3","model":"deepseek-default","choices":[{"delta":{"tool_calls":[{"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Beijing\"}"}}]},"finish_reason":"tool_calls"}]}"#,
-            )),
-        ];
-        let events = collect_events(from_chat_completion_stream(
-            futures::stream::iter(chunks),
-            15,
-        ))
+    async fn thinking_then_text() {
+        let events = collect(vec![
+            role_chunk("deepseek-expert", "chatcmpl-xyz"),
+            reasoning_chunk("thinking..."),
+            content_chunk("Answer."),
+            finish_chunk("stop"),
+        ])
         .await;
-
-        assert_eq!(events[0].0, "message_start");
-
-        // tool_use block: start (empty input) + input_json_delta + stop
-        assert_eq!(events[1].0, "content_block_start");
-        assert_eq!(events[1].1["content_block"]["type"], "tool_use");
-        assert_eq!(events[1].1["content_block"]["id"], "toolu_abc");
-        assert_eq!(events[1].1["content_block"]["name"], "get_weather");
-        assert_eq!(events[1].1["content_block"]["input"], serde_json::json!({}));
-
-        assert_eq!(events[2].0, "content_block_delta");
-        assert_eq!(events[2].1["delta"]["type"], "input_json_delta");
-        assert_eq!(
-            events[2].1["delta"]["partial_json"],
-            r#"{"city":"Beijing"}"#
-        );
-
-        assert_eq!(events[3].0, "content_block_stop");
-
-        assert_eq!(events[4].0, "message_delta");
-        assert_eq!(events[4].1["delta"]["stop_reason"], "tool_use");
-
-        assert_eq!(events[5].0, "message_stop");
+        // message_start
+        assert_eq!(events[0].event_name(), "message_start");
+        // content_block_start(thinking) + content_block_delta + content_block_stop
+        assert_eq!(events[1].event_name(), "content_block_start");
+        assert_eq!(events[2].event_name(), "content_block_delta");
+        assert_eq!(events[3].event_name(), "content_block_stop");
+        // content_block_start(text) + content_block_delta + content_block_stop
+        assert_eq!(events[4].event_name(), "content_block_start");
+        assert_eq!(events[5].event_name(), "content_block_delta");
+        assert_eq!(events[6].event_name(), "content_block_stop");
+        // message_delta + message_stop
+        assert_eq!(events[7].event_name(), "message_delta");
+        assert_eq!(events[8].event_name(), "message_stop");
+        assert_eq!(events.len(), 9);
     }
 
     #[tokio::test]
-    async fn stream_with_usage() {
-        let chunks = vec![
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-4","model":"m","choices":[{"delta":{"role":"assistant"}}]}"#,
-            )),
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-4","model":"m","choices":[{"delta":{"content":"x"}}]}"#,
-            )),
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-4","model":"m","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":12,"total_tokens":17}}"#,
-            )),
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-4","model":"m","choices":[{"delta":{},"finish_reason":"stop"}]}"#,
-            )),
-        ];
-        let events = collect_events(from_chat_completion_stream(
-            futures::stream::iter(chunks),
-            5,
-        ))
+    async fn tool_calls_only() {
+        let calls = vec![ToolCall {
+            id: "call_abc".to_string(),
+            ty: "function".to_string(),
+            function: Some(FunctionCall {
+                name: "get_weather".to_string(),
+                arguments: r#"{"city":"Beijing"}"#.to_string(),
+            }),
+            custom: None,
+            index: 0,
+        }];
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-1"),
+            tool_chunk(calls),
+            finish_chunk("tool_calls"),
+        ])
         .await;
-
-        let md_idx = events
-            .iter()
-            .position(|(n, _)| n == "message_delta")
-            .unwrap();
-        assert_eq!(events[md_idx].1["delta"]["stop_reason"], "end_turn");
-        assert_eq!(events[md_idx].1["usage"]["output_tokens"], 12);
+        // message_start
+        assert_eq!(events[0].event_name(), "message_start");
+        // tool_use: content_block_start + input_json_delta + content_block_stop
+        assert_eq!(events[1].event_name(), "content_block_start");
+        assert_eq!(events[2].event_name(), "content_block_delta");
+        assert_eq!(events[3].event_name(), "content_block_stop");
+        // message_delta(tool_use) + message_stop
+        assert_eq!(events[4].event_name(), "message_delta");
+        assert_eq!(events[5].event_name(), "message_stop");
+        assert_eq!(events.len(), 6);
+        // verify tool_use content
+        if let MessagesResponseChunk::ContentBlockStart {
+            ref content_block, ..
+        } = events[1]
+        {
+            assert!(matches!(
+                content_block,
+                ResponseContentBlock::ToolUse { .. }
+            ));
+        } else {
+            panic!("expected ToolUse");
+        }
+        // check message_delta has tool_use stop_reason
+        if let MessagesResponseChunk::MessageDelta {
+            ref stop_reason, ..
+        } = events[4]
+        {
+            assert_eq!(stop_reason.as_deref(), Some("tool_use"));
+        } else {
+            panic!("expected MessageDelta");
+        }
     }
 
     #[tokio::test]
-    async fn stream_text_and_tool_calls() {
-        let chunks = vec![
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-5","model":"m","choices":[{"delta":{"role":"assistant"}}]}"#,
-            )),
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-5","model":"m","choices":[{"delta":{"content":"Let me check"}}]}"#,
-            )),
-            Ok(openai_sse(
-                r#"{"id":"chatcmpl-5","model":"m","choices":[{"delta":{"tool_calls":[{"id":"call_def","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
-            )),
-        ];
-        let events = collect_events(from_chat_completion_stream(
-            futures::stream::iter(chunks),
-            12,
-        ))
+    async fn leading_text_then_tool_calls() {
+        let calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            ty: "function".to_string(),
+            function: Some(FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"q":"weather"}"#.to_string(),
+            }),
+            custom: None,
+            index: 0,
+        }];
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-2"),
+            content_chunk("Let me check."),
+            tool_chunk(calls),
+            finish_chunk("tool_calls"),
+        ])
         .await;
+        // message_start → text block → tool_use block → message_delta → message_stop
+        assert_eq!(events[0].event_name(), "message_start");
+        // text: start + delta + stop (stopped when transitioning to tool_use)
+        assert_eq!(events[1].event_name(), "content_block_start");
+        assert_eq!(events[2].event_name(), "content_block_delta");
+        assert_eq!(events[3].event_name(), "content_block_stop");
+        // tool_use: start + delta + stop
+        assert_eq!(events[4].event_name(), "content_block_start");
+        assert_eq!(events[5].event_name(), "content_block_delta");
+        assert_eq!(events[6].event_name(), "content_block_stop");
+        // message_delta + message_stop
+        assert_eq!(events[7].event_name(), "message_delta");
+        assert_eq!(events[8].event_name(), "message_stop");
+        assert_eq!(events.len(), 9);
+    }
 
-        // text block
-        let text_start = events
-            .iter()
-            .position(|(n, v)| n == "content_block_start" && v["content_block"]["type"] == "text")
-            .unwrap();
-        assert_eq!(events[text_start + 1].1["delta"]["text"], "Let me check");
+    #[tokio::test]
+    async fn multiple_tool_calls() {
+        let calls = vec![
+            ToolCall {
+                id: "call_a".to_string(),
+                ty: "function".to_string(),
+                function: Some(FunctionCall {
+                    name: "get_weather".to_string(),
+                    arguments: r#"{"city":"Beijing"}"#.to_string(),
+                }),
+                custom: None,
+                index: 0,
+            },
+            ToolCall {
+                id: "call_b".to_string(),
+                ty: "function".to_string(),
+                function: Some(FunctionCall {
+                    name: "get_time".to_string(),
+                    arguments: r#"{"tz":"UTC"}"#.to_string(),
+                }),
+                custom: None,
+                index: 1,
+            },
+        ];
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-3"),
+            tool_chunk(calls),
+            finish_chunk("tool_calls"),
+        ])
+        .await;
+        // message_start
+        assert_eq!(events[0].event_name(), "message_start");
+        // tool_use 1: start + delta + stop
+        assert_eq!(events[1].event_name(), "content_block_start");
+        assert_eq!(events[2].event_name(), "content_block_delta");
+        assert_eq!(events[3].event_name(), "content_block_stop");
+        // tool_use 2: start + delta + stop
+        assert_eq!(events[4].event_name(), "content_block_start");
+        assert_eq!(events[5].event_name(), "content_block_delta");
+        assert_eq!(events[6].event_name(), "content_block_stop");
+        // message_delta + message_stop
+        assert_eq!(events[7].event_name(), "message_delta");
+        assert_eq!(events[8].event_name(), "message_stop");
+    }
 
-        // tool_use block
-        let tool_start = events
-            .iter()
-            .position(|(n, v)| {
-                n == "content_block_start" && v["content_block"]["type"] == "tool_use"
-            })
-            .unwrap();
-        assert_eq!(events[tool_start].1["content_block"]["name"], "get_weather");
+    #[tokio::test]
+    async fn keepalive_during_text() {
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-4"),
+            content_chunk("Hello"),
+            keepalive_chunk(),
+            content_chunk(" world"),
+            finish_chunk("stop"),
+        ])
+        .await;
+        // message_start
+        assert_eq!(events[0].event_name(), "message_start");
+        // text block start
+        assert_eq!(events[1].event_name(), "content_block_start");
+        // text delta
+        assert_eq!(events[2].event_name(), "content_block_delta");
+        // keepalive → transition: stop text, start thinking
+        assert_eq!(events[3].event_name(), "content_block_stop");
+        assert_eq!(events[4].event_name(), "content_block_start");
+        assert_eq!(events[5].event_name(), "content_block_delta");
+        // content arrives → transition: stop thinking, start new text
+        assert_eq!(events[6].event_name(), "content_block_stop");
+        assert_eq!(events[7].event_name(), "content_block_start");
+        assert_eq!(events[8].event_name(), "content_block_delta");
+        // finish: stop text + message_delta + message_stop
+        assert_eq!(events[9].event_name(), "content_block_stop");
+        assert_eq!(events[10].event_name(), "message_delta");
+        assert_eq!(events[11].event_name(), "message_stop");
+    }
 
-        // finish
-        let md_idx = events
-            .iter()
-            .position(|(n, _)| n == "message_delta")
-            .unwrap();
-        assert_eq!(events[md_idx].1["delta"]["stop_reason"], "tool_use");
+    #[tokio::test]
+    async fn keepalive_thinking_chunk_has_tool_calls_text() {
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-5"),
+            content_chunk("Hi"),
+            keepalive_chunk(),
+            finish_chunk("stop"),
+        ])
+        .await;
+        // keepalive emits thinking delta with "tool_calls..."
+        let keepalive_delta = &events[5];
+        if let MessagesResponseChunk::ContentBlockDelta { delta, .. } = keepalive_delta {
+            if let ContentBlockDelta::Thinking { thinking } = delta {
+                assert_eq!(thinking, "tool_calls...");
+            } else {
+                panic!("expected Thinking delta");
+            }
+        } else {
+            panic!("expected ContentBlockDelta");
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_from_separate_chunk() {
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-6"),
+            content_chunk("Hi"),
+            usage_chunk(10, 5),
+            finish_chunk("stop"),
+        ])
+        .await;
+        // message_delta should carry output_tokens from usage
+        if let MessagesResponseChunk::MessageDelta {
+            ref output_tokens, ..
+        } = events[events.len() - 2]
+        {
+            assert_eq!(output_tokens.unwrap_or(0), 5);
+        } else {
+            panic!("expected MessageDelta");
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_without_content() {
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-7"),
+            finish_chunk("stop"),
+        ])
+        .await;
+        // message_start → message_delta → message_stop
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_name(), "message_start");
+        assert_eq!(events[1].event_name(), "message_delta");
+        assert_eq!(events[2].event_name(), "message_stop");
+    }
+
+    #[tokio::test]
+    async fn stream_end_without_finish() {
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-8"),
+            content_chunk("Hi"),
+        ])
+        .await;
+        // graceful shutdown: message_start → text block → ...stop?
+        // stream end without finish_reason: transition_to(None) + message_delta + message_stop
+        assert!(events.last().is_some());
+        assert_eq!(events.last().unwrap().event_name(), "message_stop");
+        // should have message_delta before message_stop
+        let delta_idx = events.len() - 2;
+        assert_eq!(events[delta_idx].event_name(), "message_delta");
+        // stop_reason should be None for graceful shutdown
+        if let MessagesResponseChunk::MessageDelta { stop_reason, .. } = &events[delta_idx] {
+            assert_eq!(stop_reason, &None);
+        }
+    }
+
+    #[tokio::test]
+    async fn message_id_mapped() {
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-a1b2c3"),
+            finish_chunk("stop"),
+        ])
+        .await;
+        if let MessagesResponseChunk::MessageStart { ref message } = events[0] {
+            assert_eq!(message.id, "msg_a1b2c3");
+        } else {
+            panic!("expected MessageStart");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_use_id_mapped() {
+        let calls = vec![ToolCall {
+            id: "call_xyz".to_string(),
+            ty: "function".to_string(),
+            function: Some(FunctionCall {
+                name: "f".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            custom: None,
+            index: 0,
+        }];
+        let events = collect(vec![
+            role_chunk("deepseek-default", "chatcmpl-9"),
+            tool_chunk(calls),
+            finish_chunk("tool_calls"),
+        ])
+        .await;
+        if let MessagesResponseChunk::ContentBlockStart {
+            ref content_block, ..
+        } = events[1]
+        {
+            if let ResponseContentBlock::ToolUse { id, .. } = content_block {
+                assert_eq!(id, "toolu_xyz");
+            } else {
+                panic!("expected ToolUse");
+            }
+        }
     }
 }

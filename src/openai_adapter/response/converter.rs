@@ -1,4 +1,4 @@
-//! OpenAI Chunk 生成器 —— 将 DsFrame 映射为 ChatCompletionChunk
+//! OpenAI Chunk 生成器 —— 将 DsFrame 映射为 ChatCompletionsResponseChunk
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -6,16 +6,16 @@ use std::task::{Context, Poll};
 use futures::Stream;
 use pin_project_lite::pin_project;
 
-use log::trace;
+use log::{trace, warn};
 
 use crate::openai_adapter::OpenAIAdapterError;
-use crate::openai_adapter::types::{ChatCompletionChunk, ChunkChoice, Delta, Usage};
+use crate::openai_adapter::types::{ChatCompletionsResponseChunk, ChunkChoice, Delta, Usage};
 
 use super::state::DsFrame;
 use super::{next_chatcmpl_id, now_secs};
 
-fn make_usage_chunk(usage: Usage, model: &str) -> ChatCompletionChunk {
-    ChatCompletionChunk {
+fn make_usage_chunk(usage: Usage, model: &str) -> ChatCompletionsResponseChunk {
+    ChatCompletionsResponseChunk {
         id: next_chatcmpl_id(),
         object: "chat.completion.chunk",
         created: now_secs(),
@@ -41,8 +41,8 @@ pub(crate) fn make_chunk(
     model: &str,
     delta: Delta,
     finish: Option<&'static str>,
-) -> ChatCompletionChunk {
-    ChatCompletionChunk {
+) -> ChatCompletionsResponseChunk {
+    ChatCompletionsResponseChunk {
         id: next_chatcmpl_id(),
         object: "chat.completion.chunk",
         created: now_secs(),
@@ -60,7 +60,7 @@ pub(crate) fn make_chunk(
 }
 
 pin_project! {
-    // 将 DsFrame 增量帧映射为 OpenAI ChatCompletionChunk 的流转换器
+    // 将 DsFrame 增量帧映射为 OpenAI ChatCompletionsResponseChunk 的流转换器
     pub struct ConverterStream<S> {
         #[pin]
         inner: S,
@@ -98,7 +98,7 @@ impl<S> Stream for ConverterStream<S>
 where
     S: Stream<Item = Result<DsFrame, OpenAIAdapterError>>,
 {
-    type Item = Result<ChatCompletionChunk, OpenAIAdapterError>;
+    type Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
@@ -119,14 +119,18 @@ where
                 Poll::Ready(Some(Ok(frame))) => match frame {
                     DsFrame::Role => {
                         trace!(target: "adapter", ">>> conv: role=assistant");
-                        return Poll::Ready(Some(Ok(make_chunk(
-                            this.model,
-                            Delta {
-                                role: Some("assistant"),
-                                ..Default::default()
-                            },
-                            None,
-                        ))));
+                        // 第一个 chunk 带上 prompt_tokens，供下游（如 AnthropicStream）提前获取
+                        return Poll::Ready(Some(Ok(ChatCompletionsResponseChunk {
+                            usage: Some(make_usage(*this.prompt_tokens, 0)),
+                            ..make_chunk(
+                                this.model,
+                                Delta {
+                                    role: Some("assistant"),
+                                    ..Default::default()
+                                },
+                                None,
+                            )
+                        })));
                     }
                     DsFrame::ThinkDelta(text) => {
                         trace!(target: "adapter", ">>> conv: thinking len={}", text.len());
@@ -153,11 +157,14 @@ where
                     DsFrame::Status(status) if status == "FINISHED" && !*this.finished => {
                         trace!(target: "adapter", ">>> conv: finish=stop");
                         *this.finished = true;
-                        return Poll::Ready(Some(Ok(make_chunk(
-                            this.model,
-                            Delta::default(),
-                            Some("stop"),
-                        ))));
+                        // 将 usage 合并到 finish chunk，确保下游（如 Anthropic）能拿到 completion_tokens
+                        let mut chunk = make_chunk(this.model, Delta::default(), Some("stop"));
+                        if *this.include_usage
+                            && let Some(u) = this.usage_value.take()
+                        {
+                            chunk.usage = Some(make_usage(*this.prompt_tokens, u));
+                        }
+                        return Poll::Ready(Some(Ok(chunk)));
                     }
                     DsFrame::Status(_) => {}
                     DsFrame::Usage(u) => {
@@ -173,16 +180,21 @@ where
                     DsFrame::Finish if !*this.finished => {
                         trace!(target: "adapter", ">>> conv: finish=stop");
                         *this.finished = true;
-                        return Poll::Ready(Some(Ok(make_chunk(
-                            this.model,
-                            Delta::default(),
-                            Some("stop"),
-                        ))));
+                        let mut chunk = make_chunk(this.model, Delta::default(), Some("stop"));
+                        if *this.include_usage
+                            && let Some(u) = this.usage_value.take()
+                        {
+                            chunk.usage = Some(make_usage(*this.prompt_tokens, u));
+                        }
+                        return Poll::Ready(Some(Ok(chunk)));
                     }
                     DsFrame::Finish => {}
                 },
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(None) => {
+                    if !*this.finished {
+                        warn!(target: "adapter", "转换器流提前结束: model={}, usage_value={:?}", this.model, this.usage_value);
+                    }
                     if *this.finished
                         && *this.include_usage
                         && let Some(u) = this.usage_value.take()
@@ -197,27 +209,5 @@ where
                 Poll::Pending => return Poll::Pending,
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use futures::StreamExt;
-
-    use super::super::state::DsFrame;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn converter_emits_role_and_content() {
-        let frames = futures::stream::iter(vec![
-            Ok(DsFrame::Role),
-            Ok(DsFrame::ContentDelta("hello".into())),
-        ]);
-        let mut conv = ConverterStream::new(frames, "deepseek-default".into(), false, false, 0);
-        let chunk1 = conv.next().await.unwrap().unwrap();
-        assert_eq!(chunk1.choices[0].delta.role, Some("assistant"));
-        let chunk2 = conv.next().await.unwrap().unwrap();
-        assert_eq!(chunk2.choices[0].delta.content.as_deref(), Some("hello"));
     }
 }

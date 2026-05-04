@@ -45,13 +45,20 @@ pub fn get_account(&self) -> Option<AccountGuard>
 
 ## 错误消息
 
-- 中文错误消息（面向用户）
+- **中文**：配置验证、账号管理等面向用户的错误消息使用中文
+- **英文**：内部库错误（`ds_core`、`client`、`adapter`、`anthropic_compat`）使用英文，供开发者调试
 - 包含上下文："账号 {} 初始化失败"
 - 避免泄露敏感信息（token 只打印前8位）
+- 服务器层的 `ServerError::Display` 向 API 客户端展示错误时，保持适配器原始消息不变
+
+## 枚举变体命名
+
+- 所有枚举变体使用 PascalCase（如 `AllAccountsFailed`、`BadRequest`）
+- 仅在 serde 序列化时通过 `#[serde(rename = "...")]` 使用非 PascalCase
 
 ## 日志规范
 
-见 `docs/logging.md`
+见 `docs/logging-spec.md`
 
 ## 导入分组
 

@@ -1,0 +1,19 @@
+{
+  "name": "文件内联上传",
+  "endpoint": "openai",
+  "category": "basic",
+  "models": ["deepseek-default", "deepseek-expert"],
+  "request": {
+    "messages": [
+      {"role": "user", "content": [
+        {"type": "text", "text": "请告诉我这个文件的内容，只回复文件中的原文即可。"},
+        {"type": "file", "file": {"file_data": "data:text/plain;base64,VGhpcyBpcyBhIHRlc3QgZG9jdW1lbnQgdXBsb2FkZWQgdmlhIGRzLWZyZWUtYXBpIGZpbGUgdXBsb2FkIGZlYXR1cmUu", "filename": "test_doc.txt"}}
+      ]}
+    ],
+    "stream": false
+  },
+  "checks": {
+    "content_not_empty": true,
+    "finish_reason": "stop"
+  }
+}

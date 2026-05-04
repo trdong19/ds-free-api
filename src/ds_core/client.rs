@@ -8,6 +8,7 @@
 
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
+use log::warn;
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
@@ -135,11 +136,13 @@ struct CreateSessionWrapper {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct UploadFileData {
     pub id: String,
+    #[allow(dead_code)]
     pub status: String,
+    #[allow(dead_code)]
     pub file_name: String,
+    #[allow(dead_code)]
     pub file_size: i64,
 }
 
@@ -149,24 +152,25 @@ pub struct FetchFilesData {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct FileInfo {
+    #[allow(dead_code)]
     pub id: String,
     pub status: String,
     pub file_name: String,
+    #[allow(dead_code)]
     pub file_size: i64,
     #[serde(default)]
     pub token_usage: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct ChallengeData {
     pub algorithm: String,
     pub challenge: String,
     pub salt: String,
     pub signature: String,
     pub difficulty: i64,
+    #[allow(dead_code)]
     pub expire_after: i64,
     pub expire_at: i64,
     pub target_path: String,
@@ -215,6 +219,26 @@ pub struct StopStreamPayload {
     pub message_id: i64,
 }
 
+/// Check if a response is an AWS WAF Challenge (US IP restriction)
+fn is_waf_challenge(resp: &reqwest::Response) -> bool {
+    resp.status().as_u16() == 202 && resp.headers().get("x-amzn-waf-action").is_some()
+}
+
+/// Print a hint when WAF challenge is detected
+fn print_waf_hint() {
+    warn!(target: "ds_core::client", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    warn!(target: "ds_core::client", "  AWS WAF Challenge detected.");
+    warn!(target: "ds_core::client", "  DeepSeek CloudFront WAF blocks US-based IPs.");
+    warn!(target: "ds_core::client", "  Rust HTTP clients can't execute the JS challenge.");
+    warn!(target: "ds_core::client", "");
+    warn!(target: "ds_core::client", "  To fix this, configure a non-US proxy in config.toml:");
+    warn!(target: "ds_core::client", "    [proxy]");
+    warn!(target: "ds_core::client", "    url = \"http://127.0.0.1:7890\"");
+    warn!(target: "ds_core::client", "");
+    warn!(target: "ds_core::client", "  https://github.com/niyue/ds-free-api");
+    warn!(target: "ds_core::client", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+}
+
 #[derive(Clone)]
 pub struct DsClient {
     http: reqwest::Client,
@@ -232,9 +256,14 @@ impl DsClient {
         user_agent: String,
         client_version: String,
         client_platform: String,
+        proxy_url: Option<&str>,
     ) -> Self {
+        let mut builder = reqwest::Client::builder();
+        if let Some(url) = proxy_url.and_then(|u| reqwest::Proxy::all(u).ok()) {
+            builder = builder.proxy(url);
+        }
         Self {
-            http: reqwest::Client::new(),
+            http: builder.build().expect("构建 HTTP 客户端失败"),
             api_base,
             wasm_url,
             user_agent,
@@ -311,6 +340,15 @@ impl DsClient {
             .json(payload)
             .send()
             .await?;
+
+        if is_waf_challenge(&resp) {
+            print_waf_hint();
+            return Err(ClientError::Status {
+                status: 202,
+                body: "WAF Challenge: use a non-US proxy".into(),
+            });
+        }
+
         Self::parse_envelope::<LoginData>(resp).await
     }
 

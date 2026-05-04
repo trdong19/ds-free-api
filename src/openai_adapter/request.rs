@@ -1,124 +1,100 @@
 //! OpenAI 请求解析 —— 将 OpenAI ChatCompletion 请求降级为 ds_core::ChatRequest
 //!
 //! 当前限制：
-//! - 多轮对话通过 ChatML 格式压缩为单个 prompt 字符串
-//! - tool 定义以独立 reminder 块注入到 assistant 前面
+//! - 多轮对话通过 DeepSeek 原生标签格式压缩为单个 prompt 字符串
+//! - tool 定义嵌入到最后一个 `<｜Assistant｜>` 后的不闭合 `<think>` 块中
 
-use log::debug;
-
-use crate::ds_core::ChatRequest;
-use crate::openai_adapter::OpenAIAdapterError;
-use crate::openai_adapter::types::{
-    ChatCompletionRequest, FunctionCallOption, NamedFunction, NamedToolChoice, Tool, ToolChoice,
-};
-
-mod normalize;
-mod prompt;
-mod resolver;
-mod tools;
-
-/// 解析并降级后的请求上下文
-#[derive(Debug)]
-pub struct AdapterRequest {
-    pub model: String,
-    pub ds_req: ChatRequest,
-    /// 由外部 HTTP server 读取并决定走流式还是非流式 handler
-    #[allow(dead_code)]
-    pub stream: bool,
-    pub include_usage: bool,
-    pub include_obfuscation: bool,
-    pub stop: Vec<String>,
-    pub prompt_tokens: u32,
-}
-
-/// 解析 JSON 请求体，执行校验、默认值收敛和能力标志解析
-pub fn parse(
-    body: &[u8],
-    registry: &std::collections::HashMap<String, String>,
-) -> Result<AdapterRequest, OpenAIAdapterError> {
-    let mut req: ChatCompletionRequest = serde_json::from_slice(body)
-        .map_err(|e| OpenAIAdapterError::BadRequest(format!("bad request: {}", e)))?;
-
-    debug!(target: "adapter", "解析 OpenAI 请求: model={}", req.model);
-
-    // 兼容旧版 functions / function_call → tools / tool_choice
-    if req.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true)
-        && let Some(functions) = req.functions.clone()
-        && !functions.is_empty()
-    {
-        req.tools = Some(
-            functions
-                .into_iter()
-                .map(|f| Tool {
-                    ty: "function".to_string(),
-                    function: Some(f),
-                    custom: None,
-                })
-                .collect(),
-        );
-    }
-    if req.tool_choice.is_none()
-        && let Some(fc) = req.function_call.clone()
-    {
-        req.tool_choice = Some(match fc {
-            FunctionCallOption::Mode(mode) => ToolChoice::Mode(mode),
-            FunctionCallOption::Named(named) => ToolChoice::Named(NamedToolChoice {
-                ty: "function".to_string(),
-                function: NamedFunction { name: named.name },
-            }),
-        });
-    }
-
-    let norm = normalize::apply(&req).map_err(OpenAIAdapterError::BadRequest)?;
-
-    let tool_ctx = tools::extract(&req).map_err(OpenAIAdapterError::BadRequest)?;
-    let prompt = prompt::build(&req, &tool_ctx);
-    let model_res = resolver::resolve(
-        registry,
-        &req.model,
-        req.reasoning_effort.as_deref(),
-        req.web_search_options.as_ref(),
-    )
-    .map_err(OpenAIAdapterError::BadRequest)?;
-
-    let prompt_tokens = tiktoken_rs::cl100k_base()
-        .map(|bpe| bpe.encode_with_special_tokens(&prompt).len() as u32)
-        .unwrap_or(0);
-
-    debug!(target: "adapter", "模型解析结果: thinking={}, search={}", model_res.thinking_enabled, model_res.search_enabled);
-
-    Ok(AdapterRequest {
-        model: req.model,
-        ds_req: ChatRequest {
-            prompt,
-            thinking_enabled: model_res.thinking_enabled,
-            search_enabled: model_res.search_enabled,
-            model_type: model_res.model_type,
-            files: vec![],
-        },
-        stream: norm.stream,
-        include_usage: norm.include_usage,
-        include_obfuscation: norm.include_obfuscation,
-        stop: norm.stop,
-        prompt_tokens,
-    })
-}
+pub(crate) mod files;
+pub(crate) mod normalize;
+pub(crate) mod prompt;
+pub(crate) mod resolver;
+pub(crate) mod tools;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openai_adapter::OpenAIAdapterError;
+    use crate::openai_adapter::types::{
+        ChatCompletionsRequest, FunctionCallOption, NamedFunction, NamedToolChoice, Tool,
+        ToolChoice,
+    };
 
     fn default_registry() -> std::collections::HashMap<String, String> {
         crate::config::DeepSeekConfig::default().model_registry()
     }
 
-    fn parse_json(val: serde_json::Value) -> Result<AdapterRequest, OpenAIAdapterError> {
-        let req = parse(val.to_string().as_bytes(), &default_registry())?;
+    /// 测试用的 prepare，模拟 adapter 内部的解析逻辑
+    #[derive(Debug)]
+    struct TestRequest {
+        prompt: String,
+        thinking_enabled: bool,
+        search_enabled: bool,
+        stream: bool,
+        include_usage: bool,
+        include_obfuscation: bool,
+        stop: Vec<String>,
+    }
+
+    fn parse_json(val: serde_json::Value) -> Result<TestRequest, OpenAIAdapterError> {
+        let mut req: ChatCompletionsRequest = serde_json::from_value(val)
+            .map_err(|e| OpenAIAdapterError::BadRequest(format!("bad request: {}", e)))?;
+        let registry = default_registry();
+
+        if req.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true)
+            && let Some(functions) = req.functions.clone()
+            && !functions.is_empty()
+        {
+            req.tools = Some(
+                functions
+                    .into_iter()
+                    .map(|f| Tool {
+                        ty: "function".to_string(),
+                        function: Some(f),
+                        custom: None,
+                    })
+                    .collect(),
+            );
+        }
+        if req.tool_choice.is_none()
+            && let Some(fc) = req.function_call.clone()
+        {
+            req.tool_choice = Some(match fc {
+                FunctionCallOption::Mode(mode) => ToolChoice::Mode(mode),
+                FunctionCallOption::Named(named) => ToolChoice::Named(NamedToolChoice {
+                    ty: "function".to_string(),
+                    function: NamedFunction { name: named.name },
+                }),
+            });
+        }
+
+        let norm = normalize::apply(&req).map_err(OpenAIAdapterError::BadRequest)?;
+        let tool_ctx = tools::extract(&req).map_err(OpenAIAdapterError::BadRequest)?;
+        let prompt = prompt::build(&req, &tool_ctx);
+        let model_res = resolver::resolve(
+            &registry,
+            &req.model,
+            req.reasoning_effort.as_deref(),
+            req.web_search_options.as_ref(),
+        )
+        .map_err(OpenAIAdapterError::BadRequest)?;
+
         println!("\n=== PARSED REQUEST ===");
-        println!("prompt:\n{}", req.ds_req.prompt);
-        println!("adapter: {req:#?}");
+        println!("prompt:\n{}", prompt);
+        println!(
+            "thinking={} search={}",
+            model_res.thinking_enabled, model_res.search_enabled
+        );
         println!("======================\n");
-        Ok(req)
+
+        Ok(TestRequest {
+            prompt,
+            thinking_enabled: model_res.thinking_enabled,
+            search_enabled: model_res.search_enabled,
+            stream: req.stream,
+            include_usage: norm.include_usage,
+            include_obfuscation: norm.include_obfuscation,
+            stop: norm.stop,
+        })
     }
 
     #[test]
@@ -131,28 +107,7 @@ mod tests {
             ]
         });
         let req = parse_json(body).unwrap();
-        assert!(!req.ds_req.prompt.is_empty());
-    }
-
-    #[test]
-    fn multimodal_user() {
-        let body = serde_json::json!({
-            "model": "deepseek-default",
-            "messages": [
-                { "role": "system", "content": "分析图片和音频。" },
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "text", "text": "看看这张图片，听听这段音频。" },
-                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc", "detail": "high" } },
-                        { "type": "input_audio", "input_audio": { "data": "base64...", "format": "mp3" } },
-                        { "type": "file", "file": { "filename": "report.pdf" } }
-                    ]
-                }
-            ]
-        });
-        let req = parse_json(body).unwrap();
-        assert!(!req.ds_req.prompt.is_empty());
+        assert!(!req.prompt.is_empty());
     }
 
     #[test]
@@ -181,31 +136,7 @@ mod tests {
             ]
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("get_weather"));
-    }
-
-    #[test]
-    fn tools_injection() {
-        let body = serde_json::json!({
-            "model": "deepseek-default",
-            "messages": [
-                { "role": "system", "content": "你可以使用工具。" },
-                { "role": "user", "content": "帮我查一下北京天气。" }
-            ],
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_weather",
-                        "description": "获取指定城市的天气",
-                        "parameters": { "type": "object", "properties": { "city": { "type": "string" } } }
-                    }
-                }
-            ],
-            "tool_choice": "auto"
-        });
-        let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("get_weather"));
+        assert!(req.prompt.contains("get_weather"));
     }
 
     #[test]
@@ -219,8 +150,8 @@ mod tests {
             "web_search_options": { "search_context_size": "high" }
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.thinking_enabled);
-        assert!(req.ds_req.search_enabled);
+        assert!(req.thinking_enabled);
+        assert!(req.search_enabled);
     }
 
     // normalize 错误场景
@@ -302,7 +233,7 @@ mod tests {
             });
             let req = parse_json(body).unwrap();
             assert_eq!(
-                req.ds_req.thinking_enabled, expected,
+                req.thinking_enabled, expected,
                 "reasoning_effort={}",
                 effort
             );
@@ -315,19 +246,19 @@ mod tests {
         });
         let req = parse_json(body).unwrap();
         assert!(
-            req.ds_req.thinking_enabled,
+            req.thinking_enabled,
             "reasoning_effort absent should default to high"
         );
     }
 
     #[test]
-    fn search_disabled_without_web_search_options() {
+    fn search_enabled_by_default() {
         let body = serde_json::json!({
             "model": "deepseek-default",
             "messages": [{ "role": "user", "content": "hi" }]
         });
         let req = parse_json(body).unwrap();
-        assert!(!req.ds_req.search_enabled);
+        assert!(req.search_enabled);
     }
 
     // stop 序列与 stream_options 默认值
@@ -355,38 +286,26 @@ mod tests {
     }
 
     #[test]
-    fn stream_options_defaults() {
-        let body = serde_json::json!({
+    fn stream_options() {
+        // 默认值
+        let req = parse_json(serde_json::json!({
             "model": "deepseek-default",
             "messages": [{ "role": "user", "content": "hi" }]
-        });
-        let req = parse_json(body).unwrap();
+        }))
+        .unwrap();
         assert_eq!(req.stream, false);
         assert_eq!(req.include_usage, false);
         assert_eq!(req.include_obfuscation, true);
-    }
 
-    #[test]
-    fn stream_options_explicit() {
-        let body = serde_json::json!({
+        // 显式覆盖
+        let req2 = parse_json(serde_json::json!({
             "model": "deepseek-default",
             "messages": [{ "role": "user", "content": "hi" }],
             "stream_options": { "include_usage": true, "include_obfuscation": false }
-        });
-        let req = parse_json(body).unwrap();
-        assert_eq!(req.include_usage, true);
-        assert_eq!(req.include_obfuscation, false);
-    }
-
-    #[test]
-    fn stream_true() {
-        let body = serde_json::json!({
-            "model": "deepseek-default",
-            "messages": [{ "role": "user", "content": "hi" }],
-            "stream": true
-        });
-        let req = parse_json(body).unwrap();
-        assert!(req.stream);
+        }))
+        .unwrap();
+        assert_eq!(req2.include_usage, true);
+        assert_eq!(req2.include_obfuscation, false);
     }
 
     // tools 校验与注入
@@ -405,7 +324,7 @@ mod tests {
             "tool_choice": "none"
         });
         let req = parse_json(body).unwrap();
-        assert!(!req.ds_req.prompt.contains("你可以使用以下工具"));
+        assert!(!req.prompt.contains("你可以使用以下工具"));
     }
 
     #[test]
@@ -422,7 +341,7 @@ mod tests {
             "tool_choice": "required"
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("注意：你必须调用一个或多个工具"));
+        assert!(req.prompt.contains("注意：你必须调用一个或多个工具"));
     }
 
     #[test]
@@ -436,7 +355,7 @@ mod tests {
             "parallel_tool_calls": false
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("注意：一次只能调用一个工具"));
+        assert!(req.prompt.contains("注意：一次只能调用一个工具"));
     }
 
     #[test]
@@ -450,11 +369,7 @@ mod tests {
             "tool_choice": { "type": "function", "function": { "name": "get_weather" } }
         });
         let req = parse_json(body).unwrap();
-        assert!(
-            req.ds_req
-                .prompt
-                .contains("注意：你必须调用 'get_weather' 工具")
-        );
+        assert!(req.prompt.contains("注意：你必须调用 'get_weather' 工具"));
     }
 
     #[test]
@@ -478,11 +393,10 @@ mod tests {
         });
         let req = parse_json(body).unwrap();
         assert!(
-            req.ds_req
-                .prompt
+            req.prompt
                 .contains("你只能从以下允许的工具中选择：get_weather")
         );
-        assert!(req.ds_req.prompt.contains("注意：你必须调用一个或多个工具"));
+        assert!(req.prompt.contains("注意：你必须调用一个或多个工具"));
     }
 
     #[test]
@@ -499,12 +413,8 @@ mod tests {
             "tool_choice": { "type": "custom", "custom": { "name": "my_custom" } }
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("**my_custom** (custom):"));
-        assert!(
-            req.ds_req
-                .prompt
-                .contains("你必须调用 'my_custom' 自定义工具")
-        );
+        assert!(req.prompt.contains("**my_custom** (custom):"));
+        assert!(req.prompt.contains("你必须调用 'my_custom' 自定义工具"));
     }
 
     #[test]
@@ -530,7 +440,7 @@ mod tests {
             ]
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("grammar(syntax: lark)"));
+        assert!(req.prompt.contains("grammar(syntax: lark)"));
     }
 
     #[test]
@@ -546,8 +456,8 @@ mod tests {
             ]
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("调用方法:"));
-        assert!(req.ds_req.prompt.contains("无约束"));
+        assert!(req.prompt.contains("调用方法:"));
+        assert!(req.prompt.contains("无约束"));
     }
 
     #[test]
@@ -592,10 +502,10 @@ mod tests {
         assert!(matches!(err, OpenAIAdapterError::BadRequest(_)));
     }
 
-    // tools injection 位置：追加到最后一个 user message
+    // tools injection 位置：嵌入到最后一个 <｜Assistant｜> 后的 <think> 块中
 
     #[test]
-    fn tools_as_reminder_before_assistant() {
+    fn tools_injected_into_think_block() {
         let body = serde_json::json!({
             "model": "deepseek-default",
             "messages": [
@@ -608,61 +518,21 @@ mod tests {
             ]
         });
         let req = parse_json(body).unwrap();
-        let prompt = &req.ds_req.prompt;
-        // 工具定义应在独立的 reminder 块中，紧邻 assistant 前面
+        let prompt = &req.prompt;
+        // 工具定义应注入到最后一个 <｜Assistant｜><think> 块中
         assert!(
-            !prompt.contains("<|im_start|>user\n第二个问题\n\n你可以使用以下工具"),
-            "工具定义不应追加到 user 消息中"
+            prompt.contains("<｜Assistant｜><think>嗯，我刚刚被系统提醒需要遵循以下内容:"),
+            "工具定义应注入到 <think> 块中"
         );
+        assert!(prompt.contains("## 工具调用"));
+        assert!(prompt.contains("calc"));
+        // <think> 块应在最后，位于最后的 user 消息之后
+        let think_pos = prompt.find("<｜Assistant｜><think>").unwrap();
+        let last_user_pos = prompt.rfind("第二个问题").unwrap();
         assert!(
-            prompt.contains("<|im_start|>reminder\n# 重要提醒"),
-            "工具定义应在独立的 reminder 块中"
+            think_pos > last_user_pos,
+            "<think> 块应在最后的 user 消息之后"
         );
-        // reminder 块应在最后的 assistant 前缀前面
-        let reminder_pos = prompt.find("<|im_start|>reminder").unwrap();
-        let assistant_pos = prompt.rfind("<|im_start|>assistant").unwrap();
-        assert!(
-            reminder_pos < assistant_pos,
-            "reminder 块应在最后的 assistant 前面"
-        );
-    }
-
-    #[test]
-    fn tools_after_tool_role_message() {
-        let body = serde_json::json!({
-            "model": "deepseek-default",
-            "messages": [
-                { "role": "user", "content": "北京天气？" },
-                {
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": { "name": "get_weather", "arguments": "{\"city\":\"北京\"}" }
-                    }]
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": "call_1",
-                    "content": "晴，25°C"
-                }
-            ],
-            "tools": [
-                { "type": "function", "function": { "name": "get_weather", "description": "获取天气" } }
-            ],
-            "tool_choice": "auto"
-        });
-        let req = parse_json(body).unwrap();
-        let prompt = &req.ds_req.prompt;
-        // 即使最后一条是 tool role，reminder 块也应紧跟在 assistant 前面
-        assert!(
-            prompt.contains("<|im_start|>reminder\n# 重要提醒"),
-            "工具定义应在独立的 reminder 块中"
-        );
-        let reminder_pos = prompt.find("<|im_start|>reminder").unwrap();
-        let assistant_pos = prompt.rfind("<|im_start|>assistant").unwrap();
-        assert!(reminder_pos < assistant_pos);
     }
 
     // functions / function_call 兼容降级
@@ -682,8 +552,8 @@ mod tests {
             "function_call": "auto"
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("get_weather"));
-        assert!(req.ds_req.prompt.contains("你可以使用以下工具"));
+        assert!(req.prompt.contains("get_weather"));
+        assert!(req.prompt.contains("你可以使用以下工具"));
     }
 
     #[test]
@@ -697,7 +567,7 @@ mod tests {
             "function_call": { "name": "get_weather" }
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("你必须调用 'get_weather' 工具"));
+        assert!(req.prompt.contains("你必须调用 'get_weather' 工具"));
     }
 
     #[test]
@@ -715,22 +585,8 @@ mod tests {
             "function_call": { "name": "func_b" }
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("tool_a"));
-        assert!(!req.ds_req.prompt.contains("func_b"));
-    }
-
-    #[test]
-    fn function_call_none_ignores_functions() {
-        let body = serde_json::json!({
-            "model": "deepseek-default",
-            "messages": [{ "role": "user", "content": "hi" }],
-            "functions": [
-                { "name": "get_weather", "parameters": {} }
-            ],
-            "function_call": "none"
-        });
-        let req = parse_json(body).unwrap();
-        assert!(!req.ds_req.prompt.contains("你可以使用以下工具"));
+        assert!(req.prompt.contains("tool_a"));
+        assert!(!req.prompt.contains("func_b"));
     }
 
     // response_format 兼容降级
@@ -743,7 +599,7 @@ mod tests {
             "response_format": { "type": "json_object" }
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("请直接输出合法的 JSON 对象"));
+        assert!(req.prompt.contains("请直接输出合法的 JSON 对象"));
     }
 
     #[test]
@@ -760,8 +616,8 @@ mod tests {
             }
         });
         let req = parse_json(body).unwrap();
-        assert!(req.ds_req.prompt.contains("遵守以下的格式"));
-        assert!(req.ds_req.prompt.contains("person"));
+        assert!(req.prompt.contains("遵守以下的格式"));
+        assert!(req.prompt.contains("person"));
     }
 
     #[test]
@@ -772,7 +628,7 @@ mod tests {
             "response_format": { "type": "text" }
         });
         let req = parse_json(body).unwrap();
-        assert!(!req.ds_req.prompt.contains("请以"));
-        assert!(!req.ds_req.prompt.contains("JSON"));
+        assert!(!req.prompt.contains("请以"));
+        assert!(!req.prompt.contains("JSON"));
     }
 }

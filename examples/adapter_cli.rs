@@ -20,7 +20,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use ds_free_api::{Config, OpenAIAdapter, StreamResponse};
+use ds_free_api::{ChatCompletionsRequest, ChatOutput, Config, OpenAIAdapter, StreamResponse};
 use futures::{StreamExt, future::join_all};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -56,7 +56,7 @@ fn read_line_lossy() -> io::Result<String> {
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::new().default_filter_or("info")).init();
 
-    let config = Config::load_with_args(std::env::args())?;
+    let (config, _config_path) = Config::load_with_args(std::env::args())?;
     println!("[初始化中...]");
     let adapter = OpenAIAdapter::new(&config).await?;
     println!(
@@ -119,9 +119,22 @@ async fn handle_line(line: &str, adapter: &OpenAIAdapter) -> anyhow::Result<bool
             let body = load_json(file)?;
             let rid = demo_req_id();
             println!(">>> chat: {} [req={}]", file, rid);
-            let mut result = adapter.chat_completions_stream(&body, &rid).await?;
+            let req = serde_json::from_slice::<ChatCompletionsRequest>(&body)?;
+            let result = adapter.chat_completions(req, &rid).await?;
             println!("[account: {}]", result.account_id);
-            print_stream(&mut result.data, false).await;
+            match result.data {
+                ChatOutput::Stream(mut s) => {
+                    use futures::StreamExt;
+                    // ChunkStream → print each chunk as JSON line
+                    while let Some(chunk) = s.next().await {
+                        match chunk {
+                            Ok(c) => println!("{}", serde_json::to_string(&c).unwrap()),
+                            Err(e) => eprintln!("流错误: {}", e),
+                        }
+                    }
+                }
+                ChatOutput::Json(json) => println!("{}", serde_json::to_string(&json).unwrap()),
+            }
         }
 
         "raw" if parts.len() >= 2 => {
@@ -129,7 +142,7 @@ async fn handle_line(line: &str, adapter: &OpenAIAdapter) -> anyhow::Result<bool
             let body = load_json(file)?;
             let rid = demo_req_id();
             println!(">>> raw: {} [req={}]", file, rid);
-            let mut result = adapter.raw_chat_stream(&body, &rid).await?;
+            let mut result = adapter.raw_chat_completions_stream(&body, &rid).await?;
             println!("[account: {}]", result.account_id);
             print_stream(&mut result.data, true).await;
         }
@@ -145,7 +158,7 @@ async fn handle_line(line: &str, adapter: &OpenAIAdapter) -> anyhow::Result<bool
                 "\n═══ RAW DEEPSEEK SSE [req={}] ═════════════════════════════════",
                 rid1
             );
-            let raw_result = adapter.raw_chat_stream(&body, &rid1).await?;
+            let raw_result = adapter.raw_chat_completions_stream(&body, &rid1).await?;
             println!("[account: {}]", raw_result.account_id);
             consume_stream(raw_result.data, |bytes| {
                 let text = String::from_utf8_lossy(&bytes);
@@ -161,15 +174,21 @@ async fn handle_line(line: &str, adapter: &OpenAIAdapter) -> anyhow::Result<bool
                 "\n═══ CONVERTED OPENAI SSE [req={}] ═════════════════════════════",
                 rid2
             );
-            let converted_result = adapter.chat_completions_stream(&body, &rid2).await?;
+            let conv_req = serde_json::from_slice::<ChatCompletionsRequest>(&body)?;
+            let converted_result = adapter.chat_completions(conv_req, &rid2).await?;
             println!("[account: {}]", converted_result.account_id);
-            consume_stream(converted_result.data, |bytes| {
-                let text = String::from_utf8_lossy(&bytes);
-                for line in text.lines() {
-                    println!("  {}", line);
+            match converted_result.data {
+                ChatOutput::Stream(mut s) => {
+                    use futures::StreamExt;
+                    while let Some(chunk) = s.next().await {
+                        match chunk {
+                            Ok(c) => println!("  {}", serde_json::to_string(&c).unwrap()),
+                            Err(e) => eprintln!("流错误: {}", e),
+                        }
+                    }
                 }
-            })
-            .await;
+                ChatOutput::Json(_) => {}
+            }
 
             println!("\n═══ END ════════════════════════════════════════════════════");
         }
@@ -190,13 +209,13 @@ async fn handle_line(line: &str, adapter: &OpenAIAdapter) -> anyhow::Result<bool
         }
 
         "models" => {
-            let json = adapter.list_models();
-            println!("{}", String::from_utf8_lossy(&json));
+            let list = adapter.list_models();
+            println!("{}", serde_json::to_string(&list).unwrap());
         }
 
         "model" if parts.len() == 2 => {
-            if let Some(json) = adapter.get_model(parts[1]) {
-                println!("{}", String::from_utf8_lossy(&json));
+            if let Some(model) = adapter.get_model(parts[1]) {
+                println!("{}", serde_json::to_string(&model).unwrap());
             } else {
                 println!("null");
             }
@@ -350,7 +369,6 @@ fn print_stream_chunk(bytes: &Bytes) {
 /// 执行并发请求
 async fn run_concurrent(adapter: &OpenAIAdapter, count: usize, body: Vec<u8>, raw: bool) {
     let start = std::time::Instant::now();
-    let is_streaming = is_stream(&body);
 
     let futures: Vec<_> = (0..count)
         .map(|i| {
@@ -358,101 +376,80 @@ async fn run_concurrent(adapter: &OpenAIAdapter, count: usize, body: Vec<u8>, ra
             async move {
                 let req_start = std::time::Instant::now();
                 let rid = demo_req_id();
-                let result = if is_streaming {
-                    match adapter.chat_completions_stream(&body, &rid).await {
-                        Ok(result) => {
-                            let mut stream = result.data;
-                            let mut output = String::new();
-                            let mut ok = true;
-                            while let Some(chunk) = stream.next().await {
-                                match chunk {
-                                    Ok(bytes) => {
-                                        if raw {
-                                            output.push_str(&String::from_utf8_lossy(&bytes));
-                                        } else {
-                                            let text = String::from_utf8_lossy(&bytes);
-                                            let json_str = text
-                                                .strip_prefix("data: ")
-                                                .and_then(|s| s.strip_suffix("\n\n"))
-                                                .unwrap_or(&text);
-                                            if let Ok(v) =
-                                                serde_json::from_str::<serde_json::Value>(json_str)
-                                            {
-                                                let delta = v
-                                                    .get("choices")
-                                                    .and_then(|c| c.get(0))
-                                                    .and_then(|c| c.get("delta"));
-                                                if let Some(c) = delta
-                                                    .and_then(|d| d.get("content"))
-                                                    .and_then(|c| c.as_str())
-                                                {
-                                                    output.push_str(c);
-                                                }
-                                                if let Some(r) = delta
-                                                    .and_then(|d| d.get("reasoning_content"))
-                                                    .and_then(|c| c.as_str())
-                                                {
-                                                    if !output.is_empty() {
-                                                        output.push(' ');
-                                                    }
-                                                    output.push_str(r);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("\n[请求{} 流错误] {}", i, e);
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            (i, ok, output, req_start.elapsed())
-                        }
-                        Err(e) => {
-                            eprintln!("[请求{} 失败] {}", i, e);
-                            (i, false, String::new(), req_start.elapsed())
-                        }
-                    }
-                } else {
-                    match adapter.chat_completions(&body, &rid).await {
-                        Ok(result) => {
-                            let json = result.data;
-                            let output = if raw {
-                                String::from_utf8_lossy(&json).to_string()
-                            } else {
-                                let v: serde_json::Value =
-                                    serde_json::from_slice(&json).unwrap_or_default();
-                                let mut parts = Vec::new();
-                                if let Some(c) = v
-                                    .get("choices")
-                                    .and_then(|c| c.get(0))
-                                    .and_then(|c| c.get("message"))
-                                    .and_then(|m| m.get("content"))
-                                    .and_then(|c| c.as_str())
-                                {
-                                    parts.push(c.to_string());
-                                }
-                                if let Some(r) = v
-                                    .get("choices")
-                                    .and_then(|c| c.get(0))
-                                    .and_then(|c| c.get("message"))
-                                    .and_then(|m| m.get("reasoning_content"))
-                                    .and_then(|c| c.as_str())
-                                {
-                                    parts.push(r.to_string());
-                                }
-                                parts.join(" ")
-                            };
-                            (i, true, output, req_start.elapsed())
-                        }
-                        Err(e) => {
-                            eprintln!("[请求{} 失败] {}", i, e);
-                            (i, false, String::new(), req_start.elapsed())
-                        }
+
+                let req = match serde_json::from_slice::<ChatCompletionsRequest>(&body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[请求{} 解析失败] {}", i, e);
+                        return (i, false, String::new(), req_start.elapsed());
                     }
                 };
-                result
+
+                let result = match adapter.chat_completions(req, &rid).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[请求{} 失败] {}", i, e);
+                        return (i, false, String::new(), req_start.elapsed());
+                    }
+                };
+
+                let (ok, output) = match result.data {
+                    ChatOutput::Stream(mut s) => {
+                        use futures::StreamExt;
+                        let mut output = String::new();
+                        let mut ok = true;
+                        while let Some(chunk) = s.next().await {
+                            match chunk {
+                                Ok(c) => {
+                                    if raw {
+                                        output.push_str(&serde_json::to_string(&c).unwrap());
+                                    } else if let Some(choice) = c.choices.first() {
+                                        if let Some(ref content) = choice.delta.content {
+                                            output.push_str(content);
+                                        }
+                                        if let Some(ref reasoning) = choice.delta.reasoning_content
+                                        {
+                                            if !output.is_empty() {
+                                                output.push(' ');
+                                            }
+                                            output.push_str(reasoning);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("\n[请求{} 流错误] {}", i, e);
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        (ok, output)
+                    }
+                    ChatOutput::Json(json) => {
+                        let output = if raw {
+                            serde_json::to_string(&json).unwrap_or_default()
+                        } else {
+                            let mut parts = Vec::new();
+                            if let Some(c) = json
+                                .choices
+                                .first()
+                                .and_then(|c| c.message.content.as_deref())
+                            {
+                                parts.push(c.to_string());
+                            }
+                            if let Some(r) = json
+                                .choices
+                                .first()
+                                .and_then(|c| c.message.reasoning_content.as_deref())
+                            {
+                                parts.push(r.to_string());
+                            }
+                            parts.join(" ")
+                        };
+                        (true, output)
+                    }
+                };
+                (i, ok, output, req_start.elapsed())
             }
         })
         .collect();
@@ -473,7 +470,7 @@ async fn run_concurrent(adapter: &OpenAIAdapter, count: usize, body: Vec<u8>, ra
             if preview.is_empty() {
                 "(无输出)".to_string()
             } else {
-                format!("{}...", preview.replace('\n', " "))
+                format!("{}...", output.replace('\n', " "))
             }
         );
     }
@@ -481,12 +478,4 @@ async fn run_concurrent(adapter: &OpenAIAdapter, count: usize, body: Vec<u8>, ra
         "  总计: {}/{} 成功 | 总耗时 {:?}",
         success_count, count, total_elapsed
     );
-}
-
-/// 判断请求体是否要求流式
-fn is_stream(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
-        .unwrap_or(false)
 }

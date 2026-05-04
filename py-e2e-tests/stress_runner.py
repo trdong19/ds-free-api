@@ -34,8 +34,9 @@ def main():
     parser.add_argument("--iterations", type=int, default=3, help="每场景迭代数 (默认: 3)")
     parser.add_argument("--parallel", type=int, default=stress_parallel, help=f"并行数 (默认: {stress_parallel})")
     parser.add_argument("--models", type=str, nargs="*", default=None, help="模型过滤")
-    parser.add_argument("--filter", type=str, default=None, help="场景名称关键字过滤")
+    parser.add_argument("--filter", type=str, nargs="*", default=None, help="场景名称关键字过滤（多个用空格分隔）")
     parser.add_argument("--report", type=str, default=None, help="输出 JSON 报告路径")
+    parser.add_argument("--show-output", action="store_true", help="显示模型输出内容")
     args = parser.parse_args()
 
     # 加载全部场景
@@ -80,19 +81,32 @@ def main():
                 result = run_anthropic(anth_client, sc, model)
             return (_idx, result)
 
+        ep_label = {"openai": "OAI", "anthropic": "ANT"}
+        task_labels: dict[int, str] = {}
+        for i, (ep, model, sc, it) in enumerate(tasks):
+            task_labels[i] = f"{ep_label.get(ep, '?')} | {sc['name']} | {model} | iter-{it + 1}"
+
         future_map = {}
         for i, (ep, model, sc, _) in enumerate(tasks):
             future = executor.submit(run_task, ep, model, sc, i)
             future_map[future] = i
 
         done = 0
+        passed = 0
         for future in as_completed(future_map):
             idx = future_map[future]
             _, result = future.result()
             all_results[idx] = result
             done += 1
-            if done % max(1, total_requests // 10) == 0 or done == total_requests:
-                print(f"  进度: {done}/{total_requests} ({done * 100 // total_requests}%)", end="\r", flush=True)
+            if result["passed"]:
+                passed += 1
+            label = task_labels[idx]
+            status = "✓" if result["passed"] else "✗"
+            err = f" | {result['error'][:60]}" if result["error"] else ""
+            print(f"  [{done}/{total_requests}] {status} | {label} | {result['duration']:.1f}s{err}")
+            if args.show_output:
+                from runner import _print_output
+                _print_output(result)
 
     total_duration = time.time() - start_total
     print(f"\n  总耗时: {format_duration(total_duration)}")

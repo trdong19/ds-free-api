@@ -41,7 +41,7 @@ def load_config() -> dict:
     return {"accounts": accounts, "safe_concurrency": safe, "api_key": api_key}
 
 
-def load_scenarios(scenario_dir: str, endpoint: str | None, filter_name: str | None) -> list[dict]:
+def load_scenarios(scenario_dir: str, endpoint: str | None, filter_names: list[str] | None) -> list[dict]:
     """加载场景 JSON 文件"""
     base = Path(scenario_dir)
     if not base.exists():
@@ -64,7 +64,7 @@ def load_scenarios(scenario_dir: str, endpoint: str | None, filter_name: str | N
         for fpath in sorted(d.glob("*.json")):
             with open(fpath) as f:
                 sc = json.load(f)
-            if filter_name and filter_name.lower() not in sc.get("name", "").lower():
+            if filter_names and not any(f.lower() in sc.get("name", "").lower() for f in filter_names):
                 continue
             scenarios.append(sc)
 
@@ -279,6 +279,25 @@ def _check_anthropic(checks: dict, result: dict) -> list[str]:
     return errors
 
 
+def _print_output(result: dict) -> None:
+    """打印模型输出内容（用于 --show-output）"""
+    content = (result.get("content") or "")[:300].replace("\n", "\\n")
+    if content:
+        print(f"    ├ 回复: {content}")
+    if result.get("has_tool_calls") or result.get("has_tool_use"):
+        calls = result.get("tool_calls") or result.get("tool_uses") or []
+        for tc in calls:
+            name = tc.get("name", "?")
+            args = tc.get("arguments") or tc.get("input") or {}
+            args_str = json.dumps(args, ensure_ascii=False)[:120]
+            print(f"    ├ 工具: {name}({args_str})")
+    fr = result.get("finish_reason") or result.get("stop_reason") or ""
+    if fr:
+        print(f"    └ 结束: {fr}")
+    if result.get("error"):
+        print(f"    └ 错误: {result['error']}")
+
+
 def format_duration(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f}s"
@@ -297,19 +316,12 @@ def print_report(results: list[dict[str, Any]], suite_name: str, parallel: int):
     print(f"{'=' * 60}")
     print(f"  总计: {total}  |  通过: {passed}  |  失败: {total - passed}  |  总耗时: {format_duration(duration)}")
 
-    # 按场景分组
-    by_scenario: dict[str, list[dict[str, Any]]] = {}
-    for r in results:
-        by_scenario.setdefault(r["name"], []).append(r)
-
-    print(f"\n  {'场景':20s} {'结果':>6s} {'模型':>12s} {'耗时':>8s}")
-    print(f"  {'─' * 48}")
-    for sname, sresults in sorted(by_scenario.items()):
-        for r in sresults:
-            status = "✓" if r["passed"] else "✗"
-            err = f"  {r['error'][:40]}" if r["error"] else ""
-            model_short = r["model"].replace("deepseek-", "ds-")
-            print(f"  {sname:20s} {status:>6s} {model_short:>12s} {r['duration']:6.1f}s{err}")
+    ep_label = {"openai": "OAI", "anthropic": "ANT"}
+    for r in sorted(results, key=lambda x: (x["name"], x.get("endpoint", ""), x["model"])):
+        status = "✓" if r["passed"] else "✗"
+        ep = ep_label.get(r.get("endpoint", ""), "?")
+        err = f" | {r['error'][:60]}" if r["error"] else ""
+        print(f"    {status} {ep} | {r['name']} | {r['model']} | {r['duration']:6.1f}s{err}")
 
     if total - passed > 0:
         print(f"\n  {'─' * 48}")
@@ -331,9 +343,10 @@ def main():
     parser.add_argument("scenario_dir", help="场景目录 (如 scenarios/basic 或 scenarios/repair)")
     parser.add_argument("--endpoint", choices=["openai", "anthropic"], default=None, help="端点过滤")
     parser.add_argument("--model", type=str, default=None, help="模型过滤")
-    parser.add_argument("--filter", type=str, default=None, help="场景名称关键字过滤")
+    parser.add_argument("--filter", type=str, nargs="*", default=None, help="场景名称关键字过滤（多个用空格分隔）")
     parser.add_argument("--parallel", type=int, default=safe_concurrency, help=f"并行数 (默认: {safe_concurrency})")
     parser.add_argument("--report", type=str, default=None, help="输出 JSON 报告路径")
+    parser.add_argument("--show-output", action="store_true", help="显示模型输出内容")
     args = parser.parse_args()
 
     scenarios = load_scenarios(args.scenario_dir, args.endpoint, args.filter)
@@ -356,6 +369,13 @@ def main():
             tasks.append((sc["endpoint"], model, sc))
 
     all_results: list[dict[str, Any]] = [None] * len(tasks)  # type: ignore[list-item]
+
+    # 记录每个任务的标签用于进度展示
+    ep_label = {"openai": "OAI", "anthropic": "ANT"}
+    task_labels: dict[int, str] = {}
+    for i, (ep, model, sc) in enumerate(tasks):
+        task_labels[i] = f"{ep_label.get(ep, '?')} | {sc['name']} | {model}"
+
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         def run_task(endpoint: str, model: str, sc: dict) -> tuple[int, dict]:
             if endpoint == "openai":
@@ -367,10 +387,21 @@ def main():
             future = executor.submit(run_task, ep, model, sc)
             future_map[future] = i
 
+        done = 0
+        passed = 0
         for future in as_completed(future_map):
             idx = future_map[future]
             _, result = future.result()
             all_results[idx] = result
+            done += 1
+            if result["passed"]:
+                passed += 1
+            label = task_labels[idx]
+            status = "✓" if result["passed"] else "✗"
+            err = f" | {result['error'][:60]}" if result["error"] else ""
+            print(f"  [{done}/{len(tasks)}] {status} | {label} | {result['duration']:.1f}s{err}")
+            if args.show_output:
+                _print_output(result)
 
     report = print_report(all_results, suite_name, args.parallel)
 

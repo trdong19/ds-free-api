@@ -2,11 +2,10 @@
 //!
 //! 原则：接口层面全对齐，无法实现的字段解析后忽略。
 
-#![allow(dead_code)]
 // 说明：本文件包含大量 OpenAI 兼容字段，其中仅以下字段/类型在 request/response 中被实际消费。
 //
 // request  层直接使用：
-//   ChatCompletionRequest.model, messages, stream, stop, tools, tool_choice,
+//   ChatCompletionsRequest.model, messages, stream, stop, tools, tool_choice,
 //   parallel_tool_calls, web_search_options, reasoning_effort
 //   涉及子类型：Message / MessageContent / ContentPart / StopSequence / Tool /
 //   FunctionDefinition / CustomTool / CustomToolFormat / GrammarDefinition /
@@ -15,7 +14,7 @@
 //   FunctionCallNamed / ResponseFormat / StreamOptions / WebSearchOptions
 //
 // response 层直接使用：
-//   ChatCompletion / Choice / MessageResponse / ChatCompletionChunk /
+//   ChatCompletionsResponse / Choice / MessageResponse / ChatCompletionsResponseChunk /
 //   ChunkChoice / Delta / Usage / ToolCall / FunctionCall / Model / ModelList
 
 use serde::{Deserialize, Serialize};
@@ -26,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 /// POST /v1/chat/completions 请求体
 #[derive(Debug, Deserialize)]
-pub struct ChatCompletionRequest {
+pub struct ChatCompletionsRequest {
     pub model: String,
     pub messages: Vec<Message>,
 
@@ -148,7 +147,7 @@ pub struct ApproximateLocation {
 }
 
 /// 对话消息
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Message {
     pub role: String,
     #[serde(default)]
@@ -168,7 +167,7 @@ pub struct Message {
 }
 
 /// 消息内容：纯文本 或 多模态 parts
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
@@ -176,7 +175,7 @@ pub enum MessageContent {
 }
 
 /// 多模态内容块
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct ContentPart {
     #[serde(rename = "type")]
     pub ty: String,
@@ -192,20 +191,20 @@ pub struct ContentPart {
     pub refusal: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct ImageUrlContent {
     pub url: String,
     #[serde(default)]
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct InputAudioContent {
     pub data: String,
     pub format: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct FileContent {
     #[serde(default)]
     pub file_data: Option<String>,
@@ -216,7 +215,7 @@ pub struct FileContent {
 }
 
 /// stop 序列：单字符串或字符串数组
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum StopSequence {
     Single(String),
@@ -388,7 +387,7 @@ impl Default for StreamOptions {
 
 /// 非流式 chat completion 响应
 #[derive(Debug, Serialize)]
-pub struct ChatCompletion {
+pub struct ChatCompletionsResponse {
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -432,7 +431,7 @@ pub struct MessageResponse {
 
 /// 流式 chunk
 #[derive(Debug, Serialize)]
-pub struct ChatCompletionChunk {
+pub struct ChatCompletionsResponseChunk {
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -491,7 +490,7 @@ pub struct Usage {
 
 /// 模型列表项
 #[derive(Debug, Serialize)]
-pub struct Model {
+pub struct OpenAIModel {
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -521,9 +520,9 @@ pub struct Model {
 
 /// 模型列表响应
 #[derive(Debug, Serialize)]
-pub struct ModelList {
+pub struct OpenAIModelList {
     pub object: &'static str,
-    pub data: Vec<Model>,
+    pub data: Vec<OpenAIModel>,
 }
 
 /// 音频响应对象

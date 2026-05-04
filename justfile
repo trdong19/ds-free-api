@@ -3,13 +3,14 @@
 set positional-arguments
 
 # Run all checks: type check, lint, format, audit, unused deps
-# 前置: cargo install cargo-audit && cargo install cargo-machete
+# 前置: cargo install cargo-audit && cargo install cargo-machete && cargo install cargo-outdated
 check:
-  cargo check
-  cargo clippy -- -D warnings
-  cargo fmt --check
+  cargo fmt --check      
+  cargo check            
+  cargo clippy -- -D warnings  
   cargo audit
-  cargo machete
+  cargo outdated --root-deps-only
+  cargo machete          
 
 # Run unified protocol debug CLI (replaces ds-core-cli / openai-adapter-cli)
 # 默认使用 py-e2e-tests/config.toml，可通过 -c <path> 覆盖

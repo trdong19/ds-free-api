@@ -1,0 +1,19 @@
+# 使用前请先创建 config.toml（cp config.example.toml config.toml）并填入账号
+
+services:
+  ds-free-api:
+    image: ghcr.io/niyueee/ds-free-api:latest
+    container_name: ds-free-api
+    restart: unless-stopped
+    ports:
+      - "5317:5317"
+    volumes:
+      - ../config.toml:/app/config.toml
+      - ds-data:/app/data
+    environment:
+      - RUST_LOG=info
+      - DS_DATA_DIR=/app/data
+      - TZ=Asia/Shanghai
+
+volumes:
+  ds-data:

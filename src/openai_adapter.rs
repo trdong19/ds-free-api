@@ -5,25 +5,39 @@
 //!
 //! 对外暴露最小接口：OpenAIAdapter, OpenAIAdapterError
 
-use bytes::Bytes;
-use futures::{Stream, StreamExt};
 use std::pin::Pin;
 use std::sync::Arc;
+
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 
 use crate::ds_core::{CoreError, DeepSeekCore};
 
 mod models;
 pub(crate) mod request;
 pub(crate) mod response;
-mod types;
+pub(crate) mod types;
 
-/// 流式响应类型
+pub use types::{ChatCompletionsRequest, ChatCompletionsResponse, ChatCompletionsResponseChunk};
+
+/// 流式响应类型（SSE 字节流）
 pub type StreamResponse = Pin<Box<dyn Stream<Item = Result<Bytes, OpenAIAdapterError>> + Send>>;
+
+/// 流式响应结构体流
+pub type ChunkStream =
+    Pin<Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>>;
+
+/// Chat Completions 统一输出
+pub enum ChatOutput {
+    Stream(ChunkStream),
+    Json(ChatCompletionsResponse),
+}
 
 /// adapter 层通用结果包装：携带请求结果和账号标识
 pub struct ChatResult<T> {
     pub data: T,
     pub account_id: String,
+    pub prompt_tokens: u32,
 }
 
 /// OpenAI 适配器
@@ -31,8 +45,12 @@ pub struct OpenAIAdapter {
     ds_core: Arc<DeepSeekCore>,
     model_types: Vec<String>,
     model_registry: std::collections::HashMap<String, String>,
+    model_aliases: std::collections::HashMap<String, String>,
     max_input_tokens: Vec<u32>,
     max_output_tokens: Vec<u32>,
+    tag_config: Arc<response::TagConfig>,
+    /// 缓存的 tiktoken BPE 编码器（避免每次请求重建）
+    bpe: Option<Arc<tiktoken_rs::CoreBPE>>,
 }
 
 impl OpenAIAdapter {
@@ -40,109 +58,197 @@ impl OpenAIAdapter {
     pub async fn new(config: &crate::config::Config) -> Result<Self, OpenAIAdapterError> {
         let ds_core = Arc::new(DeepSeekCore::new(config).await?);
         let model_registry = config.deepseek.model_registry();
+        // 预初始化 tiktoken BPE（避免每次请求重建词表）
+        let bpe = tiktoken_rs::cl100k_base().ok().map(Arc::new);
+
         Ok(Self {
             ds_core,
             model_types: config.deepseek.model_types.clone(),
             model_registry,
+            model_aliases: config.deepseek.model_aliases.clone(),
             max_input_tokens: config.deepseek.max_input_tokens.clone(),
             max_output_tokens: config.deepseek.max_output_tokens.clone(),
+            tag_config: Arc::new(response::TagConfig::from_config(&config.deepseek.tool_call)),
+            bpe,
         })
     }
 
-    /// 解析请求体为 AdapterRequest（仅解析一次，避免双重 JSON 解析）
-    pub(crate) fn parse_request(
-        &self,
-        body: &[u8],
-    ) -> Result<request::AdapterRequest, OpenAIAdapterError> {
-        request::parse(body, &self.model_registry)
-    }
-
-    /// POST /v1/chat/completions (非流式)
+    /// POST /v1/chat/completions（统一入口）
     ///
-    /// 底层复用流式接口，将 SSE 流聚合为单个 JSON 对象后返回
+    /// 内部校验参数、构建 ChatML prompt、按 stream 标记分流：
+    /// - stream=true  → 返回 SSE 字节流
+    /// - stream=false → 将 SSE 流聚合为单个 JSON 对象后返回
     pub async fn chat_completions(
         &self,
-        body: &[u8],
+        mut req: ChatCompletionsRequest,
         request_id: &str,
-    ) -> Result<ChatResult<Vec<u8>>, OpenAIAdapterError> {
-        let req = request::parse(body, &self.model_registry)?;
-        let chat_resp = self.try_chat(req.ds_req, request_id).await?;
-        let repair_fn = self.create_repair_fn(request_id);
-        let data = response::aggregate(
-            chat_resp.stream,
-            req.model,
-            req.stop,
-            req.prompt_tokens,
-            Some(repair_fn),
+    ) -> Result<ChatResult<ChatOutput>, OpenAIAdapterError> {
+        log::debug!(target: "adapter", "req={} 适配器开始处理: model={}, stream={}", request_id, req.model, req.stream);
+        use crate::openai_adapter::types::{
+            FunctionCallOption, NamedFunction, NamedToolChoice, Tool, ToolChoice,
+        };
+
+        // 兼容旧版 functions / function_call → tools / tool_choice
+        if req.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true)
+            && let Some(functions) = req.functions.clone()
+            && !functions.is_empty()
+        {
+            req.tools = Some(
+                functions
+                    .into_iter()
+                    .map(|f| Tool {
+                        ty: "function".to_string(),
+                        function: Some(f),
+                        custom: None,
+                    })
+                    .collect(),
+            );
+        }
+        if req.tool_choice.is_none()
+            && let Some(fc) = req.function_call.clone()
+        {
+            req.tool_choice = Some(match fc {
+                FunctionCallOption::Mode(mode) => ToolChoice::Mode(mode),
+                FunctionCallOption::Named(named) => ToolChoice::Named(NamedToolChoice {
+                    ty: "function".to_string(),
+                    function: NamedFunction { name: named.name },
+                }),
+            });
+        }
+
+        let norm = request::normalize::apply(&req).map_err(OpenAIAdapterError::BadRequest)?;
+        let tool_ctx = request::tools::extract(&req).map_err(OpenAIAdapterError::BadRequest)?;
+        let prompt = request::prompt::build(&req, &tool_ctx);
+        let model_res = request::resolver::resolve(
+            &self.model_registry,
+            &req.model,
+            req.reasoning_effort.as_deref(),
+            req.web_search_options.as_ref(),
         )
-        .await?;
-        Ok(ChatResult {
-            data,
-            account_id: chat_resp.account_id,
-        })
+        .map_err(OpenAIAdapterError::BadRequest)?;
+
+        let prompt_tokens = self
+            .bpe
+            .as_ref()
+            .map(|bpe| bpe.encode_with_special_tokens(&prompt).len() as u32)
+            .unwrap_or(0);
+
+        let file_result = request::files::extract(&req);
+        let chat_req = crate::ds_core::ChatRequest {
+            prompt,
+            thinking_enabled: model_res.thinking_enabled,
+            search_enabled: model_res.search_enabled || file_result.has_http_urls,
+            model_type: model_res.model_type,
+            files: file_result.files,
+        };
+
+        let chat_resp = self.try_chat(chat_req, request_id).await?;
+        let account_id = chat_resp.account_id;
+
+        // 为修复模型准备工具定义信息
+        let tool_defs = req.tools.as_ref().map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| t.function.as_ref())
+                .map(|f| {
+                    format!(
+                        "- {}: {}",
+                        f.name,
+                        serde_json::to_string(&f.parameters).unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+
+        if req.stream {
+            let repair_fn = self.create_repair_fn(request_id, tool_defs.clone());
+            let s = response::stream(
+                chat_resp.stream,
+                req.model,
+                response::StreamCfg {
+                    include_usage: norm.include_usage,
+                    include_obfuscation: norm.include_obfuscation,
+                    stop: norm.stop,
+                    prompt_tokens,
+                    repair_fn: Some(repair_fn),
+                    tag_config: self.tag_config.clone(),
+                },
+            );
+            Ok(ChatResult {
+                data: ChatOutput::Stream(s),
+                account_id,
+                prompt_tokens,
+            })
+        } else {
+            let repair_fn = self.create_repair_fn(request_id, tool_defs);
+            let json = response::aggregate(
+                chat_resp.stream,
+                req.model,
+                response::StreamCfg {
+                    include_usage: true,
+                    include_obfuscation: false,
+                    stop: norm.stop,
+                    prompt_tokens,
+                    repair_fn: Some(repair_fn),
+                    tag_config: self.tag_config.clone(),
+                },
+            )
+            .await?;
+            Ok(ChatResult {
+                data: ChatOutput::Json(json),
+                account_id,
+                prompt_tokens,
+            })
+        }
     }
 
-    /// POST /v1/chat/completions (流式)
-    pub async fn chat_completions_stream(
-        &self,
-        body: &[u8],
-        request_id: &str,
-    ) -> Result<ChatResult<StreamResponse>, OpenAIAdapterError> {
-        let req = request::parse(body, &self.model_registry)?;
-        let chat_resp = self.try_chat(req.ds_req, request_id).await?;
-        let repair_fn = self.create_repair_fn(request_id);
-        let data = response::stream(
-            chat_resp.stream,
-            req.model,
-            req.include_usage,
-            req.include_obfuscation,
-            req.stop,
-            req.prompt_tokens,
-            Some(repair_fn),
-        );
-        Ok(ChatResult {
-            data,
-            account_id: chat_resp.account_id,
-        })
-    }
-
-    /// 内部辅助：对 `Overloaded` 进行指数退避重试
+    /// 内部辅助：对 `Overloaded` 进行退避重试（v0_chat 内部已做换号重试，此处为号池级兜底）
     pub(crate) async fn try_chat(
         &self,
         req: crate::ds_core::ChatRequest,
         request_id: &str,
     ) -> Result<crate::ds_core::ChatResponse, CoreError> {
-        const MAX_RETRIES: usize = 6;
-        const BASE_DELAY_MS: u64 = 1000;
+        const MAX_RETRIES: usize = 2;
+        const BASE_DELAY_MS: u64 = 2000;
 
         for attempt in 0..MAX_RETRIES {
             match self.ds_core.v0_chat(req.clone(), request_id).await {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    if attempt > 0 {
+                        log::info!(target: "adapter", "req={} 第 {} 次重试成功", request_id, attempt);
+                    }
+                    return Ok(resp);
+                }
                 Err(CoreError::Overloaded) if attempt + 1 < MAX_RETRIES => {
                     let delay = BASE_DELAY_MS * (1 << attempt);
+                    log::warn!(target: "adapter", "req={} Overloaded, 第 {} 次重试等待 {}ms", request_id, attempt + 1, delay);
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
                 Err(e) => return Err(e),
             }
         }
+        log::warn!(target: "adapter", "req={} {} 次重试均失败，放弃", request_id, MAX_RETRIES);
         Err(CoreError::Overloaded)
     }
 
     /// GET /v1/models
-    pub fn list_models(&self) -> Vec<u8> {
+    pub fn list_models(&self) -> types::OpenAIModelList {
         models::list(
             &self.model_types,
             &self.max_input_tokens,
             &self.max_output_tokens,
+            &self.model_aliases,
         )
     }
 
     /// GET /v1/models/{model_id}
-    pub fn get_model(&self, model_id: &str) -> Option<Vec<u8>> {
+    pub fn get_model(&self, model_id: &str) -> Option<types::OpenAIModel> {
         models::get(
             &self.model_types,
             &self.max_input_tokens,
             &self.max_output_tokens,
+            &self.model_aliases,
             model_id,
         )
     }
@@ -150,13 +256,31 @@ impl OpenAIAdapter {
     /// 原始 DeepSeek SSE 流（不经 OpenAI 协议转换）
     ///
     /// 用于流分析：对比原始响应与 OpenAI 转换后的差异，定位转换 bug
-    pub async fn raw_chat_stream(
+    pub async fn raw_chat_completions_stream(
         &self,
         body: &[u8],
         request_id: &str,
     ) -> Result<ChatResult<StreamResponse>, OpenAIAdapterError> {
-        let req = request::parse(body, &self.model_registry)?;
-        let chat_resp = self.try_chat(req.ds_req, request_id).await?;
+        let chat_req: ChatCompletionsRequest = serde_json::from_slice(body)
+            .map_err(|e| OpenAIAdapterError::BadRequest(format!("bad request: {}", e)))?;
+        let model_res = request::resolver::resolve(
+            &self.model_registry,
+            &chat_req.model,
+            chat_req.reasoning_effort.as_deref(),
+            chat_req.web_search_options.as_ref(),
+        )
+        .map_err(OpenAIAdapterError::BadRequest)?;
+        let ds_req = crate::ds_core::ChatRequest {
+            prompt: request::prompt::build(
+                &chat_req,
+                &request::tools::extract(&chat_req).map_err(OpenAIAdapterError::BadRequest)?,
+            ),
+            thinking_enabled: model_res.thinking_enabled,
+            search_enabled: model_res.search_enabled,
+            model_type: model_res.model_type,
+            files: vec![],
+        };
+        let chat_resp = self.try_chat(ds_req, request_id).await?;
         let data = Box::pin(
             chat_resp
                 .stream
@@ -165,6 +289,7 @@ impl OpenAIAdapter {
         Ok(ChatResult {
             data,
             account_id: chat_resp.account_id,
+            prompt_tokens: 0,
         })
     }
 
@@ -173,31 +298,142 @@ impl OpenAIAdapter {
         self.ds_core.account_statuses()
     }
 
+    /// 动态添加账号
+    pub async fn add_account(
+        &self,
+        creds: &crate::config::Account,
+    ) -> Result<String, crate::ds_core::PoolError> {
+        self.ds_core.add_account(creds).await
+    }
+
+    /// 动态移除账号
+    pub async fn remove_account(
+        &self,
+        email_or_mobile: &str,
+    ) -> Result<String, crate::ds_core::PoolError> {
+        self.ds_core.remove_account(email_or_mobile).await
+    }
+
+    /// 标记账号为 Error 状态
+    pub fn mark_error(&self, email_or_mobile: &str) {
+        self.ds_core.mark_error(email_or_mobile)
+    }
+
+    /// 手动重新登录指定账号
+    pub async fn re_login_single(&self, email_or_mobile: &str) -> Result<(), String> {
+        self.ds_core.re_login_single(email_or_mobile).await
+    }
+}
+
+/// Diff 同步账号的结果
+pub(crate) struct SyncResult {
+    pub added: usize,
+    pub removed: usize,
+    pub failed: usize,
+}
+impl OpenAIAdapter {
+    /// 批量同步账号：对比当前账号池与目标配置，增删差异账号
+    pub(crate) async fn sync_accounts(
+        &self,
+        new_accounts: &[crate::config::Account],
+    ) -> SyncResult {
+        let old_statuses = self.account_statuses();
+        let old_ids: Vec<String> = old_statuses
+            .iter()
+            .map(|a| {
+                if !a.email.is_empty() {
+                    a.email.clone()
+                } else {
+                    a.mobile.clone()
+                }
+            })
+            .collect();
+
+        let mut added = 0usize;
+        let mut failed = 0usize;
+        for acct in new_accounts {
+            let id = if !acct.email.is_empty() {
+                &acct.email
+            } else {
+                &acct.mobile
+            };
+            if !old_ids.contains(id) {
+                match self.add_account(acct).await {
+                    Ok(_) => added += 1,
+                    Err(e) => {
+                        log::warn!(target: "adapter", "同步添加账号 {} 失败: {}", id, e);
+                        failed += 1;
+                    }
+                }
+            }
+        }
+
+        let mut removed = 0usize;
+        let new_ids: Vec<&str> = new_accounts
+            .iter()
+            .map(|a| {
+                if !a.email.is_empty() {
+                    a.email.as_str()
+                } else {
+                    a.mobile.as_str()
+                }
+            })
+            .collect();
+        for old_id in &old_ids {
+            if !new_ids.contains(&old_id.as_str()) && !old_id.is_empty() {
+                match self.remove_account(old_id).await {
+                    Ok(_) => removed += 1,
+                    Err(e) => {
+                        log::warn!(target: "adapter", "同步移除账号 {} 失败: {}", old_id, e);
+                    }
+                }
+            }
+        }
+
+        SyncResult {
+            added,
+            removed,
+            failed,
+        }
+    }
     /// 优雅关闭
     pub async fn shutdown(&self) {
         self.ds_core.shutdown().await;
     }
 
     /// 创建 tool_calls 修复闭包，捕获 Arc<DeepSeekCore> 发起修复请求
-    pub(crate) fn create_repair_fn(&self, request_id: &str) -> response::RepairFn {
+    pub(crate) fn create_repair_fn(
+        &self,
+        request_id: &str,
+        tool_defs: Option<String>,
+    ) -> response::RepairFn {
         use std::sync::atomic::{AtomicU16, Ordering};
         let core = self.ds_core.clone();
         let req_id = request_id.to_string();
         let seq = Arc::new(AtomicU16::new(0));
+        let tag_config = self.tag_config.clone();
+        let tools_info = tool_defs.unwrap_or_default();
         Arc::new(move |tool_text: String| {
             let core = core.clone();
             let req_id = req_id.clone();
             let seq = seq.clone();
+            let tag_config = tag_config.clone();
+            let tools_info = tools_info.clone();
             Box::pin(async move {
                 use crate::ds_core::ChatRequest;
                 let n = seq.fetch_add(1, Ordering::Relaxed);
                 let repair_req_id = format!("{}-repair-{}", req_id, n);
-                let prompt = format!(
+                let mut prompt = String::new();
+                if !tools_info.is_empty() {
+                    prompt.push_str(&format!("可用的工具定义：\n{}\n\n", tools_info));
+                }
+                prompt.push_str(&format!(
                     "请将以下代码块中的内容提取并转换为合法的工具调用 JSON 数组。\
                      \n每个元素必须包含 \"name\"（字符串）和 \"arguments\"（对象）字段。\
                      \n只输出 JSON 数组本身，不要加 code fence，不要其他文字解释。\
+                     \n注意：字符串值中的引号和换行符必须用反斜杠转义（如 \\\" 和 \\n）。\
                      \n\n需要修复的内容：\n~~~\n{tool_text}\n~~~"
-                );
+                ));
                 let req = ChatRequest {
                     prompt,
                     thinking_enabled: false,
@@ -213,7 +449,7 @@ impl OpenAIAdapter {
                     .v0_chat(req, &repair_req_id)
                     .await
                     .map_err(OpenAIAdapterError::from)?;
-                response::execute_tool_repair(resp.stream).await
+                response::execute_tool_repair(resp.stream, &tag_config).await
             })
         })
     }

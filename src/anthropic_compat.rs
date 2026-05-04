@@ -1,13 +1,20 @@
 //! Anthropic 协议兼容层 —— 基于 openai_adapter 提供 Anthropic API 兼容接口
 //!
 //! 本模块不直接访问 ds_core，所有数据通过 openai_adapter 获取并做格式映射。
-//! 请求流向：Anthropic JSON → openai_adapter 请求映射 → ds_core → 响应映射回 Anthropic 格式。
+//! 请求流向：Anthropic JSON → ChatCompletionsRequest → openai_adapter → 响应映射回 Anthropic 格式。
 
 mod models;
 pub(crate) mod request;
 pub(crate) mod response;
+pub(crate) mod types;
 
-/// Anthropic 流式响应类型
+pub use types::{MessagesRequest, MessagesResponse, MessagesResponseChunk};
+
+/// Anthropic 流式响应类型（结构体流）
+pub type ChunkStream =
+    Pin<Box<dyn Stream<Item = Result<MessagesResponseChunk, AnthropicCompatError>> + Send>>;
+
+/// Anthropic 流式响应类型（SSE 字节流）
 pub type StreamResponse = Pin<Box<dyn Stream<Item = Result<Bytes, AnthropicCompatError>> + Send>>;
 
 use std::pin::Pin;
@@ -17,7 +24,13 @@ use bytes::Bytes;
 use futures::Stream;
 use log::debug;
 
-use crate::openai_adapter::{ChatResult, OpenAIAdapter, OpenAIAdapterError};
+use crate::openai_adapter::{ChatOutput, ChatResult, OpenAIAdapter, OpenAIAdapterError};
+
+/// Anthropic 统一输出（对标 openai_adapter 的 ChatOutput）
+pub enum AnthropicOutput {
+    Stream(ChunkStream),
+    Json(MessagesResponse),
+}
 
 /// Anthropic 兼容层
 pub struct AnthropicCompat {
@@ -30,79 +43,51 @@ impl AnthropicCompat {
         Self { openai_adapter }
     }
 
-    /// POST /v1/messages (非流式)
+    /// POST /v1/messages（统一入口）
     ///
-    /// 将 Anthropic 请求映射为 OpenAI 请求，获取响应后再映射回 Anthropic Message 格式。
+    /// 将 Anthropic 请求映射为 ChatCompletionsRequest，委托给 openai_adapter，
+    /// 返回时再按 OpenAI 的 stream 分流结果映射回 Anthropic 格式。
     pub async fn messages(
         &self,
-        body: &[u8],
+        req: MessagesRequest,
         request_id: &str,
-    ) -> Result<ChatResult<Vec<u8>>, AnthropicCompatError> {
+    ) -> Result<ChatResult<AnthropicOutput>, AnthropicCompatError> {
         debug!(target: "anthropic_compat", "收到 messages 请求");
-        let openai_body = request::to_openai_request(body)?;
-        let openai_result = self
+        let chat_req = request::into_chat_completions(req);
+        let result = self
             .openai_adapter
-            .chat_completions(&openai_body, request_id)
+            .chat_completions(chat_req, request_id)
             .await?;
-        let data = response::from_chat_completion_bytes(&openai_result.data)
-            .map_err(|e| AnthropicCompatError::Internal(format!("json error: {}", e)))?;
+        let data = match result.data {
+            ChatOutput::Stream(stream) => {
+                AnthropicOutput::Stream(response::from_chat_completion_stream(stream))
+            }
+            ChatOutput::Json(json) => {
+                let msg = response::from_chat_completions(&json);
+                AnthropicOutput::Json(msg)
+            }
+        };
         Ok(ChatResult {
             data,
-            account_id: openai_result.account_id,
-        })
-    }
-
-    /// POST /v1/messages (流式)
-    ///
-    /// 将 Anthropic 请求映射为 OpenAI 请求，返回 Anthropic 格式的 SSE 字节流。
-    pub async fn messages_stream(
-        &self,
-        body: &[u8],
-        request_id: &str,
-    ) -> Result<ChatResult<StreamResponse>, AnthropicCompatError> {
-        debug!(target: "anthropic_compat", "收到流式 messages 请求");
-        let openai_body = request::to_openai_request(body)?;
-        let openai_req = self
-            .openai_adapter
-            .parse_request(&openai_body)
-            .map_err(AnthropicCompatError::from)?;
-        let input_tokens = openai_req.prompt_tokens;
-        let chat_resp = self
-            .openai_adapter
-            .try_chat(openai_req.ds_req, request_id)
-            .await
-            .map_err(OpenAIAdapterError::from)?;
-        let repair_fn = self.openai_adapter.create_repair_fn(request_id);
-        let openai_stream = crate::openai_adapter::response::stream(
-            chat_resp.stream,
-            openai_req.model,
-            openai_req.include_usage,
-            openai_req.include_obfuscation,
-            openai_req.stop,
-            openai_req.prompt_tokens,
-            Some(repair_fn),
-        );
-        let data = response::from_chat_completion_stream(openai_stream, input_tokens);
-        Ok(ChatResult {
-            data,
-            account_id: chat_resp.account_id,
+            account_id: result.account_id,
+            prompt_tokens: result.prompt_tokens,
         })
     }
 
     /// GET /v1/models
     ///
     /// 返回 Anthropic 格式的模型列表。
-    pub fn list_models(&self) -> Vec<u8> {
+    pub fn list_models(&self) -> models::AnthropicModelList {
         debug!(target: "anthropic_compat", "收到模型列表请求");
-        models::list(&self.openai_adapter)
+        models::list(&self.openai_adapter.list_models())
     }
 
     /// GET /v1/models/{model_id}
     ///
     /// 返回指定模型的 Anthropic 格式详情。
-    pub fn get_model(&self, model_id: &str) -> Option<Vec<u8>> {
+    pub fn get_model(&self, model_id: &str) -> Option<models::AnthropicModel> {
         debug!(target: "anthropic_compat", "查询模型: {}", model_id);
-        models::get(&self.openai_adapter, model_id)
+        models::get(&self.openai_adapter.list_models(), model_id)
     }
 }
 

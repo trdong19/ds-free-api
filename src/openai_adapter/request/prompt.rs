@@ -1,19 +1,129 @@
-//! Prompt 构建 —— 将 OpenAI messages 转换为 ChatML 格式字符串
+//! Prompt 构建 —— 将 OpenAI messages 转换为 DeepSeek 原生标签格式
 //!
-//! 若请求包含工具定义或行为指令，会以独立的 `<|im_start|>reminder` 块
-//! 插入到 `<|im_start|>assistant` 之前，确保工具上下文始终紧邻模型生成位置。
+//! 使用 `<｜System｜>`、`<｜User｜>`、`<｜Assistant｜>`、`<｜tool▁outputs▁begin｜>` 作为角色标记。
+//! 若请求包含工具定义或行为指令，会嵌入到最后一个 `<｜Assistant｜>` 后的
+//! 不闭合 `<think>` 块中，确保工具上下文始终紧邻模型生成位置。
 
 use super::tools::ToolContext;
 use crate::openai_adapter::response::{TOOL_CALL_END, TOOL_CALL_START};
-use crate::openai_adapter::types::{ChatCompletionRequest, ContentPart, Message, MessageContent};
+use crate::openai_adapter::types::{ChatCompletionsRequest, ContentPart, Message, MessageContent};
 
-const IM_START: &str = "<|im_start|>";
-const IM_END: &str = "<|im_end|>";
+/// 合并连续相同 role 的 message，避免 DeepSeek 模型对连续同角色标签产生混淆
+fn merge_messages(messages: &[Message]) -> Vec<Message> {
+    let mut merged: Vec<Message> = Vec::new();
+    for msg in messages {
+        if let Some(last) = merged.last_mut()
+            && last.role == msg.role
+            && msg.role != "tool"
+        // tool 由 build() 分组合并
+        {
+            // 合并 content
+            if let Some(ref content) = msg.content {
+                match &mut last.content {
+                    Some(last_content) => match (last_content, content) {
+                        (MessageContent::Text(a), MessageContent::Text(b)) => {
+                            a.push('\n');
+                            a.push_str(b);
+                        }
+                        (MessageContent::Parts(a), MessageContent::Parts(b)) => {
+                            a.extend(b.clone());
+                        }
+                        // 不同类型 → 都转 text 拼接
+                        (last_c, new_c) => {
+                            let new_text = format_content(new_c);
+                            let last_text = format_content(last_c);
+                            *last_c = MessageContent::Text(format!("{}\n{}", last_text, new_text));
+                        }
+                    },
+                    None => {
+                        last.content = msg.content.clone();
+                    }
+                }
+            }
+            // 合并 tool_calls
+            if let Some(ref calls) = msg.tool_calls {
+                match &mut last.tool_calls {
+                    Some(last_calls) => last_calls.extend(calls.clone()),
+                    None => last.tool_calls = msg.tool_calls.clone(),
+                }
+            }
+            // 覆盖字段：取最后一条的值
+            if msg.name.is_some() {
+                last.name.clone_from(&msg.name);
+            }
+            if msg.tool_call_id.is_some() {
+                last.tool_call_id.clone_from(&msg.tool_call_id);
+            }
+            if msg.function_call.is_some() {
+                last.function_call.clone_from(&msg.function_call);
+            }
+            if msg.refusal.is_some() {
+                last.refusal.clone_from(&msg.refusal);
+            }
+            if msg.audio.is_some() {
+                last.audio.clone_from(&msg.audio);
+            }
+            continue;
+        }
+        merged.push(msg.clone());
+    }
+    merged
+}
 
-/// 构建 ChatML 格式的 prompt 字符串
-/// 顺序: [system] [历史 user/tool/assistant 轮次...] [reminder] [最后一轮 user/tool] <|im_start|>assistant
-pub fn build(req: &ChatCompletionRequest, tool_ctx: &ToolContext) -> String {
-    let msg_parts: Vec<String> = req.messages.iter().map(format_message).collect();
+/// 生成 response_format 对应的提示文本
+fn format_response_text(rf: &crate::openai_adapter::types::ResponseFormat) -> String {
+    match rf.ty.as_str() {
+        "json_object" => {
+            "请直接输出合法的 JSON 对象，不要包含任何 markdown 代码块标记或其他解释性文字。".into()
+        }
+        "json_schema" => {
+            let schema_text = rf
+                .json_schema
+                .as_ref()
+                .map(|s| serde_json::to_string(s).unwrap_or_default())
+                .unwrap_or_default();
+            if schema_text.is_empty() {
+                "以 JSON 的形式输出。".into()
+            } else {
+                format!(
+                    "以 JSON 的形式输出，输出的 JSON 需遵守以下的格式：\n\n~~~json\n{}\n~~~",
+                    schema_text
+                )
+            }
+        }
+        "text" => String::new(),
+        _ => format!("请以 {} 格式输出。", rf.ty),
+    }
+}
+
+/// 构建 DeepSeek 原生标签格式的 prompt 字符串
+/// 顺序: [system(含 reminder)] [历史 user/tool/assistant 轮次...] <｜Assistant｜><think>[reminder]
+pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> String {
+    let messages = merge_messages(&req.messages);
+    let mut parts: Vec<String> = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].role == "tool" {
+            let mut tool_contents = Vec::new();
+            while i < messages.len() && messages[i].role == "tool" {
+                if let Some(c) = &messages[i].content {
+                    tool_contents.push(format_content(c));
+                }
+                i += 1;
+            }
+            let inner: String = tool_contents
+                .iter()
+                .map(|c| format!("<｜tool▁output▁begin｜>{}<｜tool▁output▁end｜>", c))
+                .collect();
+            parts.push(format!(
+                "<｜tool▁outputs▁begin｜>{}<｜tool▁outputs▁end｜>",
+                inner
+            ));
+        } else {
+            parts.push(format_message(&messages[i]));
+            i += 1;
+        }
+    }
 
     let mut tool_sections: Vec<String> = Vec::new();
 
@@ -27,71 +137,74 @@ pub fn build(req: &ChatCompletionRequest, tool_ctx: &ToolContext) -> String {
         tool_sections.push(format!("### 调用指令\n{}", text));
     }
 
-    let mut sections: Vec<String> = Vec::new();
+    let mut reminder_parts: Vec<String> = Vec::new();
 
     if !tool_sections.is_empty() {
-        sections.push(format!("## 工具调用\n{}", tool_sections.join("\n\n")));
+        reminder_parts.push(format!("## 工具调用\n{}", tool_sections.join("\n\n")));
     }
 
-    // response_format 降级：将格式约束注入到 reminder 块中
-    if let Some(rf) = &req.response_format {
-        let text = match rf.ty.as_str() {
-            "json_object" => {
-                "请直接输出合法的 JSON 对象，不要包含任何 markdown 代码块标记或其他解释性文字。"
-                    .into()
+    // response_format 降级：将格式约束注入到 <arg_key> 块中
+    let format_text = req
+        .response_format
+        .as_ref()
+        .map(format_response_text)
+        .unwrap_or_default();
+    if !format_text.is_empty() {
+        reminder_parts.push(format!("## 输出格式\n{}", format_text));
+    }
+
+    if !reminder_parts.is_empty() {
+        let reminder_body = reminder_parts.join("\n\n");
+
+        // System 尾部注入完整 reminder（不含"嗯"前缀，含工具定义）
+        let sys_content = format!("\n\n{}", reminder_body);
+        if let Some(sys) = parts.iter_mut().find(|p| p.starts_with("<｜System｜>")) {
+            if let Some(end) = sys.rfind('\n') {
+                sys.insert_str(end, &sys_content);
             }
-            "json_schema" => {
-                let schema_text = rf
-                    .json_schema
-                    .as_ref()
-                    .map(|s| serde_json::to_string(s).unwrap_or_default())
-                    .unwrap_or_default();
-                if schema_text.is_empty() {
-                    "以 JSON 的形式输出。".into()
-                } else {
-                    format!(
-                        "以 JSON 的形式输出，输出的 JSON 需遵守以下的格式：\n\n~~~json\n{}\n~~~",
-                        schema_text
-                    )
-                }
-            }
-            "text" => String::new(),
-            _ => format!("请以 {} 格式输出。", rf.ty),
-        };
-        if !text.is_empty() {
-            sections.push(format!("## 输出格式\n{}", text));
+        } else {
+            parts.insert(0, format!("<｜System｜>{}<｜System｜>\n", sys_content));
+        }
+
+        // <think> 中不含工具定义，只含格式规范和调用指令
+        let mut think_sections: Vec<String> = Vec::new();
+        if let Some(text) = tool_ctx.format_block.as_deref() {
+            think_sections.push(format!("### 格式规范\n{}", text));
+        }
+        if let Some(text) = tool_ctx.instruction_text.as_deref() {
+            think_sections.push(format!("### 调用指令\n{}", text));
+        }
+        let mut think_parts: Vec<String> = Vec::new();
+        if !think_sections.is_empty() {
+            think_parts.push(format!("## 工具调用\n{}", think_sections.join("\n\n")));
+        }
+        // response_format only in think
+        let think_format_text = req
+            .response_format
+            .as_ref()
+            .map(format_response_text)
+            .unwrap_or_default();
+        if !think_format_text.is_empty() {
+            think_parts.push(format!("## 输出格式\n{}", think_format_text));
+        }
+        if !think_parts.is_empty() {
+            let think_reminder = format!(
+                "嗯，我刚刚被系统提醒需要遵循以下内容:\n\n{}",
+                think_parts.join("\n\n")
+            );
+            parts.push(format!("<｜Assistant｜><think>{}\n", think_reminder));
         }
     }
 
-    // 找到最后一个 user/tool 消息的位置，reminder 插入在它前面
-    let insert_pos = req
-        .messages
-        .iter()
-        .rposition(|m| m.role == "user" || m.role == "tool")
-        .unwrap_or(msg_parts.len());
+    parts.join("")
+}
 
-    let mut parts = Vec::with_capacity(msg_parts.len() + 2);
-    parts.extend(msg_parts[..insert_pos].iter().cloned());
-    if !sections.is_empty() {
-        let extra = sections.join("\n\n");
-        parts.push(format!(
-            "{IM_START}reminder\n# 重要提醒\n\n{extra}\n{IM_END}"
-        ));
+fn role_tag(role: &str) -> String {
+    let mut r = role.to_string();
+    if let Some(c) = r.get_mut(0..1) {
+        c.make_ascii_uppercase();
     }
-    parts.extend(msg_parts[insert_pos..].iter().cloned());
-    if tool_ctx.defs_text.is_some() {
-        let instruction = format!("(工具调用请使用 {TOOL_CALL_START} 和 {TOOL_CALL_END} 包裹。)");
-        for part in parts.iter_mut().rev() {
-            if part.starts_with(&format!("{IM_START}user"))
-                || part.starts_with(&format!("{IM_START}tool"))
-            {
-                *part = part.replacen(IM_END, &format!("{instruction}\n{IM_END}"), 1);
-                break;
-            }
-        }
-    }
-    parts.push(format!("{IM_START}assistant"));
-    parts.join("\n")
+    format!("<｜{}｜>", r)
 }
 
 fn format_message(msg: &Message) -> String {
@@ -101,7 +214,17 @@ fn format_message(msg: &Message) -> String {
         "function" => format_function(msg),
         _ => format_generic(msg),
     };
-    format!("{IM_START}{}\n{}\n{IM_END}\n\n\n", msg.role, body)
+    let tag = if msg.role == "tool" {
+        String::new() // tool 用自有标签，不需要 <｜Tool｜>
+    } else {
+        role_tag(&msg.role)
+    };
+    let prefix = if msg.role == "user" {
+        "<｜end▁of▁sentence｜>"
+    } else {
+        ""
+    };
+    format!("{}{}{}", prefix, tag, body)
 }
 
 fn format_generic(msg: &Message) -> String {
@@ -157,21 +280,11 @@ fn format_assistant(msg: &Message) -> String {
 }
 
 fn format_tool(msg: &Message) -> String {
-    let mut parts = Vec::new();
-    parts.push("# 工具调用结果".to_string());
-    if let Some(name) = &msg.name {
-        parts.push(format!("## 工具名称: {}", name));
-    }
-    if let Some(id) = &msg.tool_call_id {
-        parts.push(format!("## 调用id: {}", id));
-    }
-    parts.push("## 调用结果:".to_string());
-    if let Some(content) = &msg.content {
-        parts.push("~~~".to_string());
-        parts.push(format_content(content));
-        parts.push("~~~".to_string());
-    }
-    parts.join("\n")
+    let content = msg.content.as_ref().map(format_content).unwrap_or_default();
+    format!(
+        "<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>{}<｜tool▁output▁end｜><｜tool▁outputs▁end｜>",
+        content
+    )
 }
 
 fn format_function(msg: &Message) -> String {
@@ -199,12 +312,16 @@ fn format_part(part: &ContentPart) -> String {
         "text" => part.text.clone().unwrap_or_default(),
         "refusal" => part.refusal.clone().unwrap_or_default(),
         "image_url" => {
-            let detail = part
-                .image_url
-                .as_ref()
-                .and_then(|i| i.detail.as_deref())
-                .unwrap_or("auto");
-            format!("[图片: detail={detail}]")
+            if let Some(img) = &part.image_url {
+                if img.url.starts_with("http://") || img.url.starts_with("https://") {
+                    format!("[请访问这个链接: {}]", img.url)
+                } else {
+                    let detail = img.detail.as_deref().unwrap_or("auto");
+                    format!("[图片: detail={detail}]")
+                }
+            } else {
+                "[图片]".to_string()
+            }
         }
         "input_audio" => {
             let fmt = part
@@ -220,7 +337,11 @@ fn format_part(part: &ContentPart) -> String {
                 .as_ref()
                 .and_then(|f| f.filename.as_deref())
                 .unwrap_or("unknown");
-            format!("[文件: filename={filename}]")
+            let desc = part.text.as_deref().filter(|t| !t.is_empty());
+            match desc {
+                Some(d) => format!("[文件: {d} (filename={filename})]"),
+                None => format!("[文件: filename={filename}]"),
+            }
         }
         _ => format!("[未支持的内容类型: {}]", part.ty),
     }
