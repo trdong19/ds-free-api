@@ -1,4 +1,5 @@
-# 使用前请先创建 config.toml（cp config.example.toml config.toml）并填入账号
+# Docker compose entry point — run from project root:
+#   docker compose -f docker/docker-compose.yaml up -d
 
 services:
   ds-free-api:
@@ -6,14 +7,12 @@ services:
     container_name: ds-free-api
     restart: unless-stopped
     ports:
-      - "5317:5317"
+      - "22217:22217"
     volumes:
-      - ../config.toml:/app/config.toml
-      - ds-data:/app/data
+      - ./config:/app/config
+      - ./data:/app/data
     environment:
       - RUST_LOG=info
       - DS_DATA_DIR=/app/data
+      - DS_CONFIG_PATH=/app/config/config.toml
       - TZ=Asia/Shanghai
-
-volumes:
-  ds-data:

@@ -185,6 +185,10 @@ impl AccountPool {
         client: &DsClient,
         solver: &PowSolver,
     ) -> Result<(), PoolError> {
+        if creds.is_empty() {
+            return Ok(());
+        }
+
         use futures::future::join_all;
         use std::sync::Arc;
         use tokio::sync::Semaphore;

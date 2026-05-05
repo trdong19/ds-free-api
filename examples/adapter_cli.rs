@@ -209,12 +209,12 @@ async fn handle_line(line: &str, adapter: &OpenAIAdapter) -> anyhow::Result<bool
         }
 
         "models" => {
-            let list = adapter.list_models();
+            let list = adapter.list_models().await;
             println!("{}", serde_json::to_string(&list).unwrap());
         }
 
         "model" if parts.len() == 2 => {
-            if let Some(model) = adapter.get_model(parts[1]) {
+            if let Some(model) = adapter.get_model(parts[1]).await {
                 println!("{}", serde_json::to_string(&model).unwrap());
             } else {
                 println!("null");

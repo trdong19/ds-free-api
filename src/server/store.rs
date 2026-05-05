@@ -162,46 +162,6 @@ impl StoreManager {
         guard.api_keys.iter().any(|k| k.key == key)
     }
 
-    /// 列出所有 API Key（脱敏）
-    pub async fn list_api_keys_masked(&self) -> Vec<crate::config::ApiKeyEntry> {
-        let guard = self.config.read().await;
-        guard
-            .api_keys
-            .iter()
-            .map(|k| crate::config::ApiKeyEntry {
-                key: mask_key(&k.key),
-                description: k.description.clone(),
-                created_at: k.created_at,
-            })
-            .collect()
-    }
-
-    /// 添加 API Key
-    pub async fn add_api_key(&self, description: String) -> anyhow::Result<String> {
-        let key = generate_api_key();
-        let entry = crate::config::ApiKeyEntry {
-            key: key.clone(),
-            description,
-            created_at: now_secs(),
-        };
-        let mut guard = self.config.write().await;
-        guard.api_keys.push(entry);
-        guard.save(&self.config_path)?;
-        Ok(key)
-    }
-
-    /// 删除 API Key（按完整 key 匹配）
-    pub async fn delete_api_key(&self, key: &str) -> anyhow::Result<bool> {
-        let mut guard = self.config.write().await;
-        let before = guard.api_keys.len();
-        guard.api_keys.retain(|k| k.key != key);
-        if guard.api_keys.len() == before {
-            return Ok(false);
-        }
-        guard.save(&self.config_path)?;
-        Ok(true)
-    }
-
     /// 加载持久化的统计数据
     pub async fn load_stats(&self) -> StatsStore {
         self.stats.read().await.clone()
@@ -217,27 +177,6 @@ impl StoreManager {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-
-fn generate_api_key() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill(&mut bytes);
-    format!("sk-{}", hex::encode(&bytes))
-}
-
-fn mask_key(key: &str) -> String {
-    if key.len() <= 8 {
-        "***".to_string()
-    } else {
-        format!("{}***", &key[..8])
-    }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 /// 原子写入 JSON 文件：先写 .tmp 再 rename
 fn write_json_file<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {

@@ -1,12 +1,12 @@
 [server]
-host = "127.0.0.1"
+host = "0.0.0.0"
 port = 22217
 
 # CORS 允许的 Origin 列表（默认 ["http://localhost:22217"]）
 # 设为 ["*"] 允许所有 Origin（不推荐生产使用）
 # cors_origins = ["http://localhost:22217"]
 
-# API Key 和管理密码通过 Web 管理面板配置（http://127.0.0.1:22217/admin）
+# API Key 和管理密码通过 Web 管理面板配置（http://0.0.0.0:22217/admin）
 # 首次访问时将引导设置管理密码，之后可在面板中创建/管理 API Key
 # Admin 配置（由管理面板自动管理，部署时无需手动填写）
 # [admin]
@@ -18,27 +18,14 @@ port = 22217
 # [[api_keys]]
 # key = "sk-xxx"
 # description = "My API Key"
+# created_at = 1700000000
 
-# 邮箱登录示例
-[[accounts]]
-email = "user1@example.com"
-mobile = ""
-area_code = ""
-password = "pass1"
-
-# 中国手机号登录示例
-[[accounts]]
-email = ""
-mobile = "13800138000"
-area_code = "+86"
-password = "pass2"
-
-# 国际手机号登录示例
-[[accounts]]
-email = ""
-mobile = "1234567890"
-area_code = "+1"
-password = "pass3"
+# 账号列表（通过管理面板添加，此处仅供参考）
+# [[accounts]]
+# email = "user@example.com"
+# mobile = ""
+# area_code = ""
+# password = "pass"
 
 [deepseek]
 # 工具调用标签配置

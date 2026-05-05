@@ -22,8 +22,7 @@ logs/
 
 # Web (frontend)
 web/node_modules
-web/dist/*
-!web/dist/.gitkeep
+web/dist/
 web/dist-ssr
 *.local
 

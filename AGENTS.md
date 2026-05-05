@@ -1,9 +1,9 @@
-# Repository Guidelines
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > This file serves dual duty as both `AGENTS.md` (the real file) and `CLAUDE.md` (symlink → `AGENTS.md`).
 > Edit `AGENTS.md` directly; `CLAUDE.md` stays in sync automatically.
-
-This file provides guidance to AI assistants when working with code in this repository.
 
 ---
 
@@ -17,7 +17,7 @@ Rust API proxy exposing free DeepSeek model endpoints. Translates standard OpenA
 - `wasmtime` — executes DeepSeek's PoW WASM solver; the entire PoW system depends on this
 - `tiktoken-rs` — client-side prompt token counting (DeepSeek returns 0 for `prompt_tokens`)
 - `pin-project-lite` — underpins every streaming response wrapper (`SseStream`, `StateStream`, etc.)
-- `axum` / `reqwest` — HTTP server and client respectively
+- `axum` / `rquest` — HTTP server and client respectively; `rquest` uses BoringSSL with Chrome 136 TLS fingerprint for WAF bypass
 - `tokio` with `signal` feature — async runtime with graceful shutdown on SIGTERM/SIGINT
 
 ---
@@ -51,13 +51,12 @@ src/
 │   │   ├── prompt.rs    # ChatML → DeepSeek native tags, tool injection
 │   │   ├── resolver.rs  # Model resolution, capability toggles
 │   │   └── tiktoken.rs  # Token counting
-│   └── response/        # Response pipeline: sse_parser → state → converter → tool_parser → StopStream
+│   └── response/        # Response pipeline: sse_parser → state → converter → tool_parser
 │       ├── response.rs  # Facade + StreamCfg struct
 │       ├── sse_parser.rs    # SseStream: raw bytes → SseEvent (event+data)
 │       ├── state.rs         # StateStream: DeepSeek JSON patches → DsFrame
 │       ├── converter.rs     # ConverterStream: DsFrame → ChatCompletionsResponseChunk
 │       ├── tool_parser.rs   # ToolCallStream: XML tag detection, sliding-window repair
-│       └── stop_stream.rs   # StopStream: stop sequence filtering
 │
 ├── anthropic_compat/    # Anthropic protocol translator (on top of openai_adapter)
 │   ├── anthropic_compat.rs # Facade
@@ -104,6 +103,50 @@ This means the file tree does not directly map to the public API. To understand 
 - `server/stream.rs::SseBody` wraps `StreamResponse` and converts it into an `axum::body::Body`
 - This decouples the adapters from the HTTP framework — they produce bytes, the server handles SSE framing
 
+
+### CI Build Pipeline
+
+On tag push (`.github/workflows/release.yml`):
+
+```
+build-frontend (npm ci + npm run build)
+build-frontend (npm ci + npm run build)
+  ├── build-linux-gnu (cargo build)    │
+  ├── build-linux-musl (cross/cargo)   │── release (tar.gz + zip)
+  ├── build-macos (cargo build)  │
+  └── build-windows (cargo build)│
+  └── docker (ghcr.io image)
+```
+
+`build-frontend` produces a `web-dist` artifact. Each build job downloads it before
+compiling Rust, so `rust_embed` embeds the real frontend assets.
+
+### Frontend (`web/`)
+
+Vite + React + shadcn/ui SPA under `web/`. Built by `npm run build` in `web/`.
+The binary embeds `web/dist/` via `rust_embed` at compile time.
+
+```
+web/
+├── src/
+│   ├── App.tsx            # Routes (login + protected layout + pages)
+│   ├── lib/api.ts         # Typed API client for all admin endpoints
+│   ├── lib/auth.tsx       # JWT auth context (localStorage token)
+│   ├── pages/             # ConfigPage, DashboardPage, Layout, LoginPage, LogsPage, ModelsPage
+│   └── components/ui/     # shadcn/ui primitives (badge, button, card, input, etc.)
+├── public/favicon.svg     # → symlink to assets/logo.svg
+├── index.html
+├── package.json
+└── vite.config.ts
+```
+
+**Admin panel config editor**: `ConfigPage.tsx` fetches from `GET /admin/api/config`,
+edits all sections (accounts, api_keys, server, deepseek, models, proxy, tool_call tags),
+submits via `PUT /admin/api/config` (full replace + hot-reload). Passwords/key values
+sent as `***`/empty are merged with existing values server-side.
+
+**Dev mode (HMR)**: Run `cd web && npm run dev` (Vite HMR) alongside `just serve`.
+Backend reads from `web/dist/` filesystem when available.
 ---
 
 ## Principles
@@ -168,14 +211,13 @@ ChatCompletionsRequest
   → if req.stream → ChatCompletionsResponseChunk | else → ChatCompletionsResponse
 ```
 
-### Response Pipeline (OpenAI) — 5-Layer Stream Chain
+### Response Pipeline (OpenAI) — 4-Layer Stream Chain
 
 ```
 ds_core SSE bytes → SseStream (sse_parser)
                  → StateStream (state/patch machine)
                  → ConverterStream (converter)
                  → ToolCallStream (tool_parser)
-                 → StopStream (stop sequences)
                  → SSE bytes
 ```
 
@@ -248,7 +290,7 @@ The `x-ds-account` HTTP response header carries the account identifier upstream.
 
 | Endpoint | Handler | Description |
 |----------|---------|-------------|
-| `GET /` | `handlers::root` | Health check / OK |
+| `GET /` | `handlers::root` | Redirect to /admin |
 | `POST /v1/chat/completions` | `handlers::openai_chat` | OpenAI chat completion |
 | `GET /v1/models` | `handlers::openai_models` | List models |
 | `GET /v1/models/{id}` | `handlers::openai_model` | Get model |
@@ -256,7 +298,7 @@ The `x-ds-account` HTTP response header carries the account identifier upstream.
 | `GET /anthropic/v1/models` | `handlers::anthropic_models` | List models (Anthropic format) |
 | `GET /anthropic/v1/models/{id}` | `handlers::anthropic_model` | Get model (Anthropic format) |
 
-Optional Bearer auth via `[[server.api_tokens]]` in config; no auth when empty.
+Optional Bearer auth via `[[api_keys]]` in config; no auth when empty.|
 
 ### Model ID Mapping
 
@@ -326,15 +368,17 @@ Follow `docs/code-style.md`:
 - Do **NOT** use untargeted log macros — always specify `target: "..."`
 - Do **NOT** access `ds_core` directly from `anthropic_compat` — always go through `OpenAIAdapter`
 - Do **NOT** add `#[allow(...)]` outside `src/ds_core/client.rs` — dead API methods and deserialized fields for API symmetry are expected only in the raw HTTP client layer
-
 - Do **NOT** keep admin/auth config in separate JSON files (`admin.json`, `api_keys.json`) — they are merged into `Config` fields and persisted via `Config::save()` into `config.toml`
+- Do **NOT** run `git checkout`, `git commit`, or `gh` commands without explicit user permission — always ask before destructive or persistent operations
 ---
 
 ## Troubleshooting
 
 | Issue | Symptom | Likely Cause / Fix |
 |-------|---------|--------------------|
-| WASM load failure | `PowError::Execution` on startup | DeepSeek recompiled WASM and changed export ordering. Check `__wbindgen_export_0` symbol in `pow.rs` or update `wasm_url` in `config.toml` |
+| WASM load failure | `PowError::Execution` on startup | DeepSeek recompiled WASM. PowSolver now uses dynamic export probing (no hardcoded symbols). Update `wasm_url` in `config.toml` if WASM URL changed |
+| WAF blocking (non-US) | AWS WAF Challenge response (status 202) | Configure a non-US proxy in `config.toml` `[proxy]` |
+| WAF blocking (fingerprint) | HTTP 403 or connection reset | `rquest` with BoringSSL automatically emulates Chrome 136 TLS fingerprint. If blocked, try updating `rquest` or switching emulation profile |
 | Account init failure | All accounts stuck in init | Bad credentials (login fails first) or rate-limited (too many sessions). Check `[accounts]` in config |
 | Tool call parse failure | No `tool_calls` in response, raw XML visible | Model output a tag variant not in the parse list. Add fallback `extra_starts`/`extra_ends` in `config.toml` `[deepseek]` |
 | Rate limited | Repeated `CoreError::Overloaded` | Add more accounts or reduce concurrency. 6x exponential backoff handles transient spikes |
@@ -353,8 +397,8 @@ Follow `docs/code-style.md`:
 | Chat orchestration + file upload | `src/ds_core/completions.rs` | `v0_chat()`, history splitting, upload retry, `GuardedStream` |
 | OpenAI request parsing | `src/openai_adapter/request/` | normalize → tools → files → prompt → resolver |
 | File upload extraction | `src/openai_adapter/request/files.rs` | data URL → FilePayload, HTTP URL → search mode |
-| OpenAI response conversion | `src/openai_adapter/response/` | sse_parser → state → converter → tool_parser → stop_stream |
-| Tool call tag config | `src/openai_adapter/response/tool_parser.rs` | `TagConfig` with extra_starts/extra_ends fallback arrays |
+| OpenAI response conversion | `src/openai_adapter/response/` | sse_parser → state → converter → tool_parser |
+| Tool call parser & stop sequences | `src/openai_adapter/response/tool_parser.rs` | `TagConfig` with extra_starts/extra_ends; stop filtering embedded |
 | Stream pipeline config | `src/openai_adapter/response.rs` | `StreamCfg` struct (consolidates 8 stream params) |
 | Anthropic compat layer | `src/anthropic_compat/` | Built on openai_adapter, no direct ds_core access |
 | Anthropic streaming response | `src/anthropic_compat/response/stream.rs` | OpenAI SSE → Anthropic SSE event stream |
@@ -374,7 +418,7 @@ Follow `docs/code-style.md`:
 | Logging spec | `docs/logging-spec.md` | Targets, levels, message format for `log` crate |
 | Prompt injection strategy | `docs/deepseek-prompt-injection.md` | DeepSeek native tags, claude-3.5-sonnet system prompt research |
 | API reference | `docs/deepseek-api-reference.md` | DeepSeek endpoint details |
-| Admin panel routes | `src/server/admin.rs` | Setup/login/config/stats/models/keys handlers |
+| Admin panel routes | `src/server/admin.rs` | Setup/login/config/status/stats/models/logs handlers |
 | JWT auth + password | `src/server/auth.rs` | `setup_admin()`/`login_admin()`, JWT sign/verify, login rate limiter |
 | Store manager | `src/server/store.rs` | API key validation, stats persistence, delegates admin/keys to `Config::save()` |
 | Request stats | `src/server/stats.rs` | `RequestStats`, `StatsHandle`, background flush to `stats.json` |
@@ -385,8 +429,7 @@ Follow `docs/code-style.md`:
 ## Commands
 
 ```bash
-# Setup (do not commit config.toml)
-cp config.example.toml config.toml
+# Setup (config auto-created on first run; copy example only if you want defaults)
 
 # Enable pre-commit hook (check + clippy + fmt + audit + machete + cargo test)
 git config core.hooksPath .githooks
@@ -425,10 +468,11 @@ cargo test
 # Run only library tests (skips example compilation, faster iteration)
 cargo test --lib
 
-# e2e tests (requires `uv`, server on port 5317)
+# e2e tests (requires `uv`, server on port 22217)
 just e2e-basic    # Basic: 基础功能测试（OpenAI + Anthropic 双端点）
 just e2e-repair   # Repair: 工具调用损坏修复专项测试
 just e2e-stress   # Stress: 全部场景 × 3 次迭代压测
+# See docs/development.md for full e2e CLI parameters (filter, parallel, model, report, etc.)
 
 # Start server with e2e config
 just e2e-serve
@@ -444,7 +488,7 @@ cargo machete      # requires: cargo install cargo-machete
 cargo build
 cargo build --release
 
-# Release (tag push triggers CI: 8 targets x 4 platforms via cross)
+# Release (tag push triggers CI: 8 targets, 4 platforms, aarch64 on ARM runners)
 git tag v0.x.x
 git push origin v0.x.x
 # CI extracts changelog from CHANGELOG.md, creates GitHub release

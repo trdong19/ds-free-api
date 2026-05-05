@@ -286,7 +286,7 @@ pub(crate) async fn chat_completions(
 /// GET /v1/models
 pub(crate) async fn list_models(State(state): State<AppState>) -> Response {
     log::debug!(target: "http::request", "GET /v1/models");
-    let bytes = serde_json::to_vec(&state.adapter.list_models()).unwrap();
+    let bytes = serde_json::to_vec(&state.adapter.list_models().await).unwrap();
     log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
     (
         StatusCode::OK,
@@ -303,7 +303,7 @@ pub(crate) async fn get_model(
 ) -> Result<Response, ServerError> {
     log::debug!(target: "http::request", "GET /v1/models/{}", id);
 
-    match state.adapter.get_model(&id) {
+    match state.adapter.get_model(&id).await {
         Some(model) => {
             let bytes = serde_json::to_vec(&model).unwrap();
             log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
@@ -405,7 +405,7 @@ pub(crate) async fn anthropic_messages(
 /// GET /anthropic/v1/models
 pub(crate) async fn anthropic_list_models(State(state): State<AppState>) -> Response {
     log::debug!(target: "http::request", "GET /anthropic/v1/models");
-    let bytes = serde_json::to_vec(&state.anthropic_compat.list_models()).unwrap();
+    let bytes = serde_json::to_vec(&state.anthropic_compat.list_models().await).unwrap();
     log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());
     (
         StatusCode::OK,
@@ -422,7 +422,7 @@ pub(crate) async fn anthropic_get_model(
 ) -> Result<Response, ServerError> {
     log::debug!(target: "http::request", "GET /anthropic/v1/models/{}", id);
 
-    match state.anthropic_compat.get_model(&id) {
+    match state.anthropic_compat.get_model(&id).await {
         Some(model) => {
             let bytes = serde_json::to_vec(&model).unwrap();
             log::debug!(target: "http::response", "200 JSON response {} bytes", bytes.len());

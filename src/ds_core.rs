@@ -54,6 +54,7 @@ impl DeepSeekCore {
             config.deepseek.user_agent.clone(),
             config.deepseek.client_version.clone(),
             config.deepseek.client_platform.clone(),
+            config.deepseek.client_locale.clone(),
             config.proxy.url.as_deref(),
         );
 
@@ -118,5 +119,9 @@ impl DeepSeekCore {
     /// 优雅关闭：清理所有账号的 session
     pub async fn shutdown(&self) {
         self.completions.shutdown().await;
+    }
+
+    pub async fn reload_config(&self, config: &Config) -> Result<(), CoreError> {
+        self.completions.reload_config(config).await
     }
 }

@@ -19,9 +19,8 @@ use axum::{
     extract::Request,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
-use serde::Serialize;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 
@@ -116,25 +115,8 @@ fn build_router(state: AppState, cors_origins: Vec<String>) -> Router {
         .route("/admin/api/stats", get(admin::admin_stats))
         .route("/admin/api/models", get(admin::admin_models))
         .route("/admin/api/config", get(admin::admin_config))
-        // API Key management
-        .route("/admin/api/keys", get(admin::admin_list_keys))
-        .route("/admin/api/keys", post(admin::admin_create_key))
-        .route(
-            "/admin/api/keys/{key}",
-            axum::routing::delete(admin::admin_delete_key),
-        )
-        // Account management
-        .route("/admin/api/accounts", post(admin::admin_add_account))
-        .route(
-            "/admin/api/accounts/{id}",
-            axum::routing::delete(admin::admin_remove_account),
-        )
-        .route(
-            "/admin/api/accounts/{id}/relogin",
-            post(admin::admin_relogin_account),
-        )
-        // Config hot-reload
-        .route("/admin/api/reload", post(admin::admin_reload_config))
+        // Config
+        .route("/admin/api/config", put(admin::admin_put_config))
         // Request logs
         .route("/admin/api/logs", get(admin::admin_logs))
         // Runtime logs
@@ -187,7 +169,13 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
 
     CorsLayer::new()
         .allow_origin(allowed)
-        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
@@ -234,30 +222,8 @@ async fn serve_embedded_spa() -> Response {
     }
 }
 
-#[derive(Serialize)]
-struct RootResponse {
-    endpoints: Vec<String>,
-    message: &'static str,
-}
-
-async fn root() -> Json<RootResponse> {
-    Json(RootResponse {
-        endpoints: vec![
-            "GET /".into(),
-            "GET /health".into(),
-            "POST /v1/chat/completions".into(),
-            "GET /v1/models".into(),
-            "GET /v1/models/{id}".into(),
-            "POST /anthropic/v1/messages".into(),
-            "GET /anthropic/v1/models".into(),
-            "GET /anthropic/v1/models/{id}".into(),
-            "GET /admin/api/status".into(),
-            "GET /admin/api/stats".into(),
-            "GET /admin/api/models".into(),
-            "GET /admin/api/config".into(),
-        ],
-        message: "https://github.com/NIyueeE/ds-free-api",
-    })
+async fn root() -> axum::response::Redirect {
+    axum::response::Redirect::to("/admin")
 }
 
 /// Health check endpoint
