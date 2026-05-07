@@ -1,10 +1,10 @@
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 
-
 WORKDIR /app
 
-COPY target/x86_64-unknown-linux-musl/release/ds-free-api /app/ds-free-api
+ARG TARGETARCH
+COPY target/docker/${TARGETARCH}/ds-free-api /app/ds-free-api
 COPY docker/config.example.toml /app/config/config.toml
 
 ENV RUST_LOG=info \

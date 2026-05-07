@@ -138,11 +138,8 @@ fn build_router(state: AppState, cors_origins: Vec<String>) -> Router {
                 .fallback(tower_http::services::ServeFile::new("web/dist/index.html")),
         )
     } else {
-        // 编译时嵌入：API 路由优先，其余走 SPA fallback
-        router
-            .route("/admin/assets/{*path}", get(serve_embedded_asset))
-            .route("/admin/favicon.svg", get(serve_embedded_asset))
-            .route("/admin/{*path}", get(serve_embedded_spa))
+        // 编译时嵌入：fallback 模式，不注册具体路由，无冲突风险
+        router.fallback(serve_embedded_fallback)
     };
 
     router
@@ -188,38 +185,39 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
 #[folder = "web/dist/"]
 struct WebAssets;
 
-/// 提供嵌入的静态资源（JS/CSS/SVG 等）
-async fn serve_embedded_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+/// 编译时嵌入资源 fallback：仅处理 /admin 及 /admin/* 路径，其余返回 404
+async fn serve_embedded_fallback(uri: axum::http::Uri) -> Response {
     use axum::http::{StatusCode, header};
 
-    let file = WebAssets::get(&path);
-    match file {
-        Some(content) => {
-            let mime = mime_guess::from_path(&path).first_or_octet_stream();
-            (
+    let path = uri.path();
+    if path == "/admin" || path.starts_with("/admin/") {
+        let key = path
+            .strip_prefix("/admin/")
+            .unwrap_or("")
+            .trim_start_matches('/');
+        if !key.is_empty()
+            && let Some(content) = WebAssets::get(key)
+        {
+            let mime = mime_guess::from_path(key).first_or_octet_stream();
+            return (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, mime.as_ref())],
                 content.data,
             )
-                .into_response()
+                .into_response();
         }
-        None => StatusCode::NOT_FOUND.into_response(),
+        // SPA fallback
+        if let Some(content) = WebAssets::get("index.html") {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                content.data,
+            )
+                .into_response();
+        }
     }
-}
 
-/// SPA fallback: 所有非资源路径返回 index.html
-async fn serve_embedded_spa() -> Response {
-    use axum::http::{StatusCode, header};
-
-    match WebAssets::get("index.html") {
-        Some(content) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            content.data,
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+    StatusCode::NOT_FOUND.into_response()
 }
 
 async fn root() -> axum::response::Redirect {
