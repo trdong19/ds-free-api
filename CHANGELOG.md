@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+- **PoW WASM 运行时**：`wasmtime`（JIT/cranelift）→ `wasmi`（纯解释执行）。
+  wasmi 是纯 Rust 实现，不依赖 `memfd_create`、`MAP_JIT` 等现代内核特性，
+  可在内核 4.4 的 LXC 容器（如 Termux）中正常运行。
+  同时移除了 CI 中 `cmake`/`libclang-dev` 等 wasmtime 专属构建依赖，
+  二进制体积更小，交叉编译更简单。
+
 ## [0.2.6] - 2026-05-05
 
 ### Added
