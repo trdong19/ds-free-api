@@ -1,17 +1,17 @@
 //! PoW 计算器 —— 基于 DeepSeek WASM 的 DeepSeekHashV1 算法实现
 //!
-//! 通过签名动态探测 wasm-bindgen 导出符号，避免硬编码 __wbindgen_export_0 导致
-//! DeepSeek 更新 WASM 后无法启动。
+//! 使用 wasmi（纯解释执行）替代 wasmtime，无需 JIT / cranelift，
+//! 兼容低版本内核（如 4.4）的 LXC 容器环境。
 
-use wasmtime::{AsContextMut, Engine, InstancePre, Linker, Module, Store, ValType};
+use wasmi::core::ValType;
+use wasmi::{Engine, ExternType, Linker, Module, Store};
 
 // 复用 client 的 ChallengeData，避免重复定义
 pub use crate::ds_core::client::ChallengeData as Challenge;
 
 #[derive(Clone)]
 pub struct PowSolver {
-    engine: Engine,
-    instance_pre: InstancePre<()>,
+    module: Module,
     add_to_stack_name: String,
     alloc_name: String,
     solve_name: String,
@@ -62,12 +62,11 @@ impl PowSolver {
         let engine = Engine::default();
         let module =
             Module::new(&engine, wasm_bytes).map_err(|e| PowError::WasmInit(e.to_string()))?;
-        let linker = Linker::new(&engine);
-        let instance_pre = linker
-            .instantiate_pre(&module)
-            .map_err(|e| PowError::WasmInit(e.to_string()))?;
 
-        let exports: Vec<_> = module.exports().collect();
+        let exports: Vec<_> = module
+            .exports()
+            .map(|e| (e.name().to_string(), e.ty().clone()))
+            .collect();
 
         let add_to_stack_name = find_export_by_names(
             &exports,
@@ -113,9 +112,9 @@ impl PowSolver {
         .or_else(|| {
             let candidates: Vec<_> = exports
                 .iter()
-                .filter(|e| {
+                .filter(|(_, ty)| {
                     matches_sig(
-                        e,
+                        ty,
                         &[
                             ValType::I32,
                             ValType::I32,
@@ -127,7 +126,7 @@ impl PowSolver {
                         &[],
                     )
                 })
-                .map(|e| e.name().to_string())
+                .map(|(name, _)| name.clone())
                 .collect();
             if candidates.len() == 1 {
                 Some(candidates.into_iter().next().unwrap())
@@ -138,8 +137,7 @@ impl PowSolver {
         .ok_or_else(|| PowError::WasmInit("wasm_solve export not found".to_string()))?;
 
         Ok(Self {
-            engine,
-            instance_pre,
+            module,
             add_to_stack_name,
             alloc_name,
             solve_name,
@@ -151,24 +149,27 @@ impl PowSolver {
             return Err(PowError::UnsupportedAlgorithm(challenge.algorithm.clone()));
         }
 
-        let mut store = Store::new(&self.engine, ());
+        let engine = self.module.engine();
+        let mut store = Store::new(engine, ());
+        let linker = Linker::new(engine);
 
-        let instance = self
-            .instance_pre
-            .instantiate(&mut store)
+        let instance = linker
+            .instantiate(&mut store, &self.module)
+            .map_err(|e| PowError::Execution(e.to_string()))?
+            .start(&mut store)
             .map_err(|e| PowError::Execution(e.to_string()))?;
 
         let memory = instance
-            .get_memory(&mut store, "memory")
+            .get_memory(&store, "memory")
             .ok_or_else(|| PowError::Execution("memory not found".to_string()))?;
         let add_to_stack = instance
-            .get_typed_func::<i32, i32>(&mut store, &self.add_to_stack_name)
+            .get_typed_func::<i32, i32>(&store, &self.add_to_stack_name)
             .map_err(|e| PowError::Execution(e.to_string()))?;
         let alloc = instance
-            .get_typed_func::<(i32, i32), i32>(&mut store, &self.alloc_name)
+            .get_typed_func::<(i32, i32), i32>(&store, &self.alloc_name)
             .map_err(|e| PowError::Execution(e.to_string()))?;
         let wasm_solve = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32, f64), ()>(&mut store, &self.solve_name)
+            .get_typed_func::<(i32, i32, i32, i32, i32, f64), ()>(&store, &self.solve_name)
             .map_err(|e| PowError::Execution(e.to_string()))?;
 
         let prefix = format!("{}_{}_", challenge.salt, challenge.expire_at);
@@ -196,13 +197,13 @@ impl PowSolver {
 
         let mut status_buf = [0u8; 4];
         memory
-            .read(&mut store, retptr as usize, &mut status_buf)
+            .read(&store, retptr as usize, &mut status_buf)
             .map_err(|e| PowError::Execution(e.to_string()))?;
         let status = i32::from_le_bytes(status_buf);
 
         let mut value_buf = [0u8; 8];
         memory
-            .read(&mut store, (retptr + 8) as usize, &mut value_buf)
+            .read(&store, (retptr + 8) as usize, &mut value_buf)
             .map_err(|e| PowError::Execution(e.to_string()))?;
         let value = f64::from_le_bytes(value_buf);
 
@@ -227,28 +228,27 @@ impl PowSolver {
 
 fn write_string(
     store: &mut Store<()>,
-    memory: &wasmtime::Memory,
-    alloc: &wasmtime::TypedFunc<(i32, i32), i32>,
+    memory: &wasmi::Memory,
+    alloc: &wasmi::TypedFunc<(i32, i32), i32>,
     text: &str,
 ) -> Result<(i32, i32), PowError> {
     let bytes = text.as_bytes();
     let len = bytes.len() as i32;
     let ptr = alloc
-        .call(store.as_context_mut(), (len, 1))
+        .call(&mut *store, (len, 1))
         .map_err(|e| PowError::Execution(e.to_string()))?;
     memory
-        .write(store.as_context_mut(), ptr as usize, bytes)
+        .write(&mut *store, ptr as usize, bytes)
         .map_err(|e| PowError::Execution(e.to_string()))?;
     Ok((ptr, len))
 }
 
-fn matches_sig(export: &wasmtime::ExportType<'_>, params: &[ValType], results: &[ValType]) -> bool {
-    let ext_ty = export.ty();
-    let Some(func_ty) = ext_ty.func() else {
+fn matches_sig(ty: &ExternType, params: &[ValType], results: &[ValType]) -> bool {
+    let Some(func_ty) = ty.func() else {
         return false;
     };
-    let p: Vec<_> = func_ty.params().collect();
-    let r: Vec<_> = func_ty.results().collect();
+    let p = func_ty.params().to_vec();
+    let r = func_ty.results().to_vec();
     p.len() == params.len()
         && r.len() == results.len()
         && p.iter()
@@ -260,30 +260,30 @@ fn matches_sig(export: &wasmtime::ExportType<'_>, params: &[ValType], results: &
 }
 
 fn find_export_by_names(
-    exports: &[wasmtime::ExportType<'_>],
+    exports: &[(String, ExternType)],
     names: &[&str],
     params: &[ValType],
     results: &[ValType],
 ) -> Option<String> {
     for name in names {
-        if let Some(export) = exports.iter().find(|e| e.name() == *name)
-            && matches_sig(export, params, results)
+        if let Some((export_name, ty)) = exports.iter().find(|(n, _)| n == *name)
+            && matches_sig(ty, params, results)
         {
-            return Some(name.to_string());
+            return Some(export_name.clone());
         }
     }
     None
 }
 
 fn find_export_by_prefix(
-    exports: &[wasmtime::ExportType<'_>],
+    exports: &[(String, ExternType)],
     prefix: &str,
     params: &[ValType],
     results: &[ValType],
 ) -> Option<String> {
     exports
         .iter()
-        .filter(|e| e.name().starts_with(prefix))
-        .find(|e| matches_sig(e, params, results))
-        .map(|e| e.name().to_string())
+        .filter(|(name, _)| name.starts_with(prefix))
+        .find(|(_, ty)| matches_sig(ty, params, results))
+        .map(|(name, _)| name.clone())
 }

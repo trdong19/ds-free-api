@@ -47,8 +47,6 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy,rustfmt
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libclang-dev
       - name: cargo check
         run: cargo check
       - name: cargo clippy
@@ -62,7 +60,12 @@ jobs:
       - name: cargo machete
         run: command -v cargo-machete || cargo install cargo-machete --locked && cargo machete
       - name: cargo outdated
-        run: command -v cargo-outdated || cargo install cargo-outdated --locked && cargo outdated --exit-code 1 --root-deps-only
+        run: |
+          command -v cargo-outdated || cargo install cargo-outdated --locked
+          output=$(cargo outdated --root-deps-only 2>&1)
+          echo "$output"
+          # Fail only if there are outdated deps other than wasmi (intentionally pinned at 0.x)
+          echo "$output" | grep -E "^\w+\s+\d" | grep -v "^wasmi" | grep -q . && exit 1 || true
   test:
     needs: [build-frontend]
     runs-on: ubuntu-latest
@@ -75,7 +78,5 @@ jobs:
           path: web/dist/
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libclang-dev
       - name: cargo test
         run: cargo test

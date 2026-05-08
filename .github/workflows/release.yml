@@ -73,7 +73,7 @@ jobs:
           cache-key: ${{ matrix.target }}
       - name: Install build dependencies (aarch64)
         if: ${{ matrix.runner == 'ubuntu-24.04-arm' }}
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config g++
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config g++
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - name: Package
@@ -137,7 +137,7 @@ jobs:
       - name: Install base dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake perl pkg-config libclang-dev musl-tools
+          sudo apt-get install -y build-essential perl pkg-config libclang-dev musl-tools
       - name: Install target-specific APT dependencies
         if: ${{ matrix.apt_packages != '' }}
         run: |
@@ -249,7 +249,6 @@ jobs:
       - name: Install dependencies
         shell: cmd
         run: |
-          choco install cmake -y
           choco install strawberryperl -y
           choco install pkgconfiglite -y
           choco install llvm -y
