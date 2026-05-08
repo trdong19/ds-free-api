@@ -112,7 +112,20 @@ impl PowSolver {
         .or_else(|| {
             let candidates: Vec<_> = exports
                 .iter()
-                .filter(|(_, ty)| matches_sig(ty, &[ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::F64], &[]))
+                .filter(|(_, ty)| {
+                    matches_sig(
+                        ty,
+                        &[
+                            ValType::I32,
+                            ValType::I32,
+                            ValType::I32,
+                            ValType::I32,
+                            ValType::I32,
+                            ValType::F64,
+                        ],
+                        &[],
+                    )
+                })
                 .map(|(name, _)| name.clone())
                 .collect();
             if candidates.len() == 1 {
