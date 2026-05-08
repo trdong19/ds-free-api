@@ -47,8 +47,6 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy,rustfmt
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libclang-dev
       - name: cargo check
         run: cargo check
       - name: cargo clippy
@@ -75,7 +73,5 @@ jobs:
           path: web/dist/
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake g++ libclang-dev
       - name: cargo test
         run: cargo test

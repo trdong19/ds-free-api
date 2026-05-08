@@ -14,7 +14,7 @@ Rust API proxy exposing free DeepSeek model endpoints. Translates standard OpenA
 **Runtime:** Rust **1.95.0** (pinned in `rust-toolchain.toml`) with **edition 2024**.
 
 **Key dependencies and why they exist:**
-- `wasmtime` — executes DeepSeek's PoW WASM solver; the entire PoW system depends on this
+- `wasmi` — executes DeepSeek's PoW WASM solver (纯解释执行，无需 JIT/cranelift，兼容低版本内核)
 - `tiktoken-rs` — client-side prompt token counting (DeepSeek returns 0 for `prompt_tokens`)
 - `pin-project-lite` — underpins every streaming response wrapper (`SseStream`, `StateStream`, etc.)
 - `axum` / `rquest` — HTTP server and client respectively; `rquest` uses BoringSSL with Chrome 136 TLS fingerprint for WAF bypass
@@ -35,7 +35,7 @@ src/
 ├── ds_core/             # DeepSeek implementation facade (src/ds_core.rs)
 │   ├── ds_core.rs       # Facade: DeepSeekCore, CoreError; declares submodules
 │   ├── accounts.rs      # Account pool: init validation, idle-aware selection, AccountGuard (Drop → release)
-│   ├── pow.rs           # PoW solver: wasmtime WASM loader, DeepSeekHashV1 computation
+│   ├── pow.rs           # PoW solver: wasmi WASM loader, DeepSeekHashV1 computation
 │   ├── completions.rs   # Chat orchestration: create_session → upload → PoW → stream → GuardedStream
 │   └── client.rs        # Raw HTTP client: API endpoints, Envelope parsing, zero business logic
 │
@@ -406,7 +406,7 @@ Follow `docs/code-style.md`:
 | OpenAI protocol types | `src/openai_adapter/types.rs` | Request/response structs, `#![allow(dead_code)]` |
 | Model listing | `src/openai_adapter/models.rs` | Model registry and listing |
 | HTTP server/routes | `src/server/` | handlers → stream → error |
-| PoW WASM solver | `src/ds_core/pow.rs` | wasmtime loading, dynamic export probing, DeepSeekHashV1 |
+| PoW WASM solver | `src/ds_core/pow.rs` | wasmi loading, dynamic export probing, DeepSeekHashV1 |
 | DeepSeek HTTP client | `src/ds_core/client.rs` | `Envelope::into_result()`, WAF detection, all API methods |
 | Unified debug CLI | `examples/adapter_cli.rs` | Modes: chat/raw/compare/concurrent/status/models |
 | Example request JSON | `examples/adapter_cli/` | Pre-built ChatCompletionsRequest samples |
