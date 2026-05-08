@@ -234,8 +234,8 @@ fn matches_sig(ty: &ExternType, params: &[ValType], results: &[ValType]) -> bool
     let Some(func_ty) = ty.func() else {
         return false;
     };
-    let p: Vec<_> = func_ty.params().iter().copied().collect();
-    let r: Vec<_> = func_ty.results().iter().copied().collect();
+    let p = func_ty.params().to_vec();
+    let r = func_ty.results().to_vec();
     p.len() == params.len()
         && r.len() == results.len()
         && p.iter()
