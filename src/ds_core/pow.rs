@@ -3,7 +3,8 @@
 //! 使用 wasmi（纯解释执行）替代 wasmtime，无需 JIT / cranelift，
 //! 兼容低版本内核（如 4.4）的 LXC 容器环境。
 
-use wasmi::{Engine, ExternType, Linker, Module, Store, ValType};
+use wasmi::core::ValType;
+use wasmi::{Engine, ExternType, Linker, Module, Store};
 
 // 复用 client 的 ChallengeData，避免重复定义
 pub use crate::ds_core::client::ChallengeData as Challenge;
